@@ -48,6 +48,24 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: 安装所需依赖
+        run: |
+          set -euo pipefail
+          # Deepin 容器基础镜像不含 git,必须先装上才能后续 git submodule / git clone vcpkg
+          apt-get update
+          apt-get install -y --no-install-recommends \
+              build-essential cmake ninja-build pkg-config \
+              autoconf autoconf-archive automake libtool \
+              gettext bison flex curl unzip zip zstd xz-utils \
+              ccache ca-certificates git \
+              nasm yasm \
+              libgl1 libglu1-mesa libasound2 libpulse0 \
+              libxkbcommon0 libwayland-client0 libxrandr2 libxinerama1 \
+              libxcursor1 libxi6 libxext6 libglib2.0-0 \
+              libfontconfig1 libfreetype6 libudev1 libdbus-1-3 \
+              python3
+          rm -rf /var/lib/apt/lists/*
+
       - name: 启用子模块(公网回退)
         run: |
           set -euo pipefail
@@ -68,23 +86,6 @@ jobs:
           key: linux-x64-cache-v1-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/workflows/x64.yml') }}
           restore-keys: |
             linux-x64-cache-v1-${{ runner.os }}-
-
-      - name: 安装所需依赖
-        run: |
-          set -euo pipefail
-          apt-get update
-          apt-get install -y --no-install-recommends \
-              build-essential cmake ninja-build pkg-config \
-              autoconf autoconf-archive automake libtool \
-              gettext bison flex curl unzip zip zstd xz-utils \
-              ccache ca-certificates git \
-              nasm yasm \
-              libgl1 libglu1-mesa libasound2 libpulse0 \
-              libxkbcommon0 libwayland-client0 libxrandr2 libxinerama1 \
-              libxcursor1 libxi6 libxext6 libglib2.0-0 \
-              libfontconfig1 libfreetype6 libudev1 libdbus-1-3 \
-              python3
-          rm -rf /var/lib/apt/lists/*
 
       - name: 安装模块
         run: |
