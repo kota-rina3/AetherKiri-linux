@@ -95,19 +95,33 @@ jobs:
             echo "==> Deepin 仓库无 gobjc,跳过(依赖编译前的 OBJC sed 修补)"
           fi
           # X11 dev 兜底:AetherKiri 的 overlay libgdiplus portfile 在 Linux 上无条件
-          # -DWITH_X11=ON,X11 不是 vcpkg port 是系统库,所以容器里必须有 X11 dev headers
-          # (libx11-dev / libxext-dev / libxrender-dev / libfontconfig1-dev 等)。
-          # 单独 apt + 容错,避免一个包名缺失拖垮全部。
-          if apt-get install -y --no-install-recommends \
-              libx11-dev libxext-dev libxrender-dev libxrandr-dev \
-              libxinerama-dev libxcursor-dev libxi-dev \
-              libfontconfig1-dev libfreetype6-dev \
-              xorg-sgml-doctool xutils-dev \
-              libcairo2-dev libpango1.0-dev libglib2.0-dev; then
-            echo "==> X11 / cairo / pango dev headers 已安装"
-            pkg-config --modversion x11 xext xrender cairo pango 2>&1 | head -10
+          # -DWITH_X11=ON,X11 不是 vcpkg port 是系统库,所以容器里必须有 X11 dev headers。
+          # 教训:不能把一堆包装进一条 apt-get install —— Deepin 仓库缺任何一个包名都会
+          # 导致整条命令失败、全军覆没(和 gobjc 一样的坑),所以逐个装、缺哪个跳哪个。
+          X11_PKGS="libx11-dev libxext-dev libxrender-dev libxrandr-dev \
+                    libxinerama-dev libxcursor-dev libxi-dev libxau-dev libxdmcp-dev \
+                    libxcb1-dev libpthread-stubs-dev \
+                    libfontconfig1-dev libfreetype6-dev \
+                    libcairo2-dev libpango1.0-dev libglib2.0-dev"
+          FAILED_PKGS=""
+          for p in $X11_PKGS; do
+            if apt-get install -y --no-install-recommends "$p" >/dev/null 2>&1; then
+              echo "  [ok]   $p"
+            else
+              echo "  [miss] $p  (Deepin 仓库未收录,跳过)"
+              FAILED_PKGS="$FAILED_PKGS $p"
+            fi
+          done
+          if [[ -n "$FAILED_PKGS" ]]; then
+            echo "::warning::以下 X11/cairo dev 包未装上:$FAILED_PKGS"
+          fi
+          # 关键自检:x11 + xrender 是 libgdiplus WITH_X11=ON 的硬需求
+          if pkg-config --exists x11 && pkg-config --exists xrender; then
+            echo "==> pkg-config x11/xrender 自检通过:"
+            pkg-config --modversion x11 xrender
           else
-            echo "::warning::X11/cairo dev 部分安装失败,libgdiplus 可能仍需 X11 deps"
+            echo "::error::pkg-config 找不到 x11 或 xrender,libgdiplus 的 find_package(X11 REQUIRED) 必挂"
+            exit 1
           fi
 
       - name: 检查代码
@@ -258,6 +272,23 @@ jobs:
             tail -100 build-logs/build.log
           else
             echo "==> build.log 不存在,跳过日志收集"
+          fi
+          # 把 vcpkg 每个 port 的 config-*-out.log 直接打到控制台:
+          # vcpkg 的 BUILD_FAILED 主日志只有一行,真实报错都在 buildtrees/<port>/ 下。
+          # 这里直接在 Actions 日志里展开,免去翻 artifact。
+          BT="${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees"
+          if [[ -d "$BT" ]]; then
+            find "$BT" -maxdepth 2 -type f -name "config-*-out.log" 2>/dev/null | sort | while read -r f; do
+              rel="${f#$BT/}"
+              # 只打最近 1 小时内修改过的(即本次运行产生的),避免缓存里的旧日志刷屏
+              if [[ -n "$(find "$f" -mmin -60 2>/dev/null)" ]]; then
+                echo ""
+                echo "=============================================="
+                echo "==> vcpkg configure 日志: $rel (尾部 80 行)"
+                echo "=============================================="
+                tail -80 "$f" || true
+              fi
+            done
           fi
 
       - name: 收集 vcpkg buildtrees 日志(失败诊断)
