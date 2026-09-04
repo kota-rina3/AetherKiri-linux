@@ -1,0 +1,193 @@
+name: Linux x64 Build (Deepin)
+
+on:
+  workflow_dispatch:
+    branches: [master]
+    inputs:
+      build_type:
+        description: 编译类型
+        type: choice
+        required: true
+        default: release
+        options:
+          - release
+          - debug
+
+concurrency:
+  group: linux-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 编译构建
+    runs-on: ubuntu-latest
+    container: linuxdeepin/deepin:crimson-amd64-v1.6.0
+
+    env:
+      GODOT_RELEASE: 4.7-stable
+      GODOT_TEMPLATE_VERSION: 4.7.stable
+      AETHERKIRI_ENABLE_INTERNAL: "OFF"
+      AETHERKIRI_CACHE_DIR: ${{ github.workspace }}/.aetherkiri-cache
+      CCACHE_DIR: ${{ github.workspace }}/.aetherkiri-cache/ccache
+      VCPKG_ROOT: ${{ github.workspace }}/.aetherkiri-cache/vcpkg
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/.aetherkiri-cache/vcpkg-downloads
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.aetherkiri-cache/vcpkg-binaries
+      DEBIAN_FRONTEND: noninteractive
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      BUILD_TYPE: ${{ inputs.build_type }}
+
+    steps:
+      - name: 检查代码
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 启用子模块(公网回退)
+        run: |
+          set -euo pipefail
+          # OnscripterYuri 公共子模块
+          git submodule update --init --depth 1 packages/OnscripterYuri
+          # .gitmodules 中 psdfile 引用 SSH,CI 中强制覆盖为 HTTPS,免去 SSH 部署
+          git -c submodule.packages/psdfile.url=https://github.com/AetherKiri/psdfile.git \
+              submodule update --init --recursive --depth 1 packages/psdfile
+
+      - name: 缓存工具链与下载
+        uses: actions/cache@v4
+        with:
+          path: |
+            .aetherkiri-cache/godot
+            .aetherkiri-cache/downloads
+            .aetherkiri-cache/vcpkg
+            .aetherkiri-cache/system-tools
+          key: linux-x64-cache-v1-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/workflows/x64.yml') }}
+          restore-keys: |
+            linux-x64-cache-v1-${{ runner.os }}-
+
+      - name: 安装所需依赖
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+              build-essential cmake ninja-build pkg-config \
+              autoconf autoconf-archive automake libtool \
+              gettext bison flex curl unzip zip zstd xz-utils \
+              ccache ca-certificates git \
+              nasm yasm \
+              libgl1 libglu1-mesa libasound2 libpulse0 \
+              libxkbcommon0 libwayland-client0 libxrandr2 libxinerama1 \
+              libxcursor1 libxi6 libxext6 libglib2.0-0 \
+              libfontconfig1 libfreetype6 libudev1 libdbus-1-3 \
+              python3
+          rm -rf /var/lib/apt/lists/*
+
+      - name: 安装模块
+        run: |
+          set -euo pipefail
+          # 自动克隆并 bootstrap vcpkg、下载 Godot 4.7-stable 与 export templates
+          bash tools/setup_linux.sh
+
+      - name: 配置 ccache
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache --max-size=2G
+          ccache -z
+
+      - name: 配置 vcpkg 二进制缓存
+        env:
+          VCPKG_PACKAGES_TOKEN: ${{ github.token }}
+        run: |
+          # 复用上游脚本,接入 GitHub Packages 缓存,大幅加速重复构建
+          if [[ -f .github/scripts/configure-vcpkg-binary-cache.sh ]]; then
+            bash .github/scripts/configure-vcpkg-binary-cache.sh "$VCPKG_ROOT/vcpkg"
+          else
+            echo "::notice::未找到 vcpkg 二进制缓存脚本,跳过(继续构建)"
+          fi
+
+      - name: 编译
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          source tools/linux_env.sh
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          chmod +x ./build.sh
+          echo "==> 开始 Linux ${BUILD_TYPE} 编译 ($(nproc) jobs)"
+          ./build.sh linux "$BUILD_TYPE" --jobs=$(nproc) 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: ccache 统计
+        if: always()
+        run: |
+          echo "==> ccache 统计"
+          ccache -s || true
+
+      - name: 校验构建产物
+        if: always()
+        run: |
+          set -euo pipefail
+          BIN_DIR="out/godot/linux/${BUILD_TYPE}"
+          BIN="$BIN_DIR/AetherKiri.x86_64"
+          if [[ -f "$BIN" ]]; then
+            echo "==> 二进制存在"
+            ls -lh "$BIN"
+            file "$BIN"
+            echo "==> 共享库依赖(前 30 行)"
+            ldd "$BIN" | head -30
+            echo "==> 完整产物清单"
+            ls -lh "$BIN_DIR"
+          else
+            echo "::error::构建产物未生成:$BIN"
+            exit 1
+          fi
+
+      - name: 收集构建日志
+        if: always()
+        run: |
+          mkdir -p build-logs
+          if [[ -f "$RUNNER_TEMP/build.log" ]]; then
+            cp "$RUNNER_TEMP/build.log" build-logs/build.log
+            echo "==> 构建日志尾部(最后 100 行)"
+            tail -100 build-logs/build.log
+          else
+            echo "==> build.log 不存在,跳过日志收集"
+          fi
+
+      - name: 打包构建产物
+        if: always()
+        run: |
+          set -euo pipefail
+          BIN_DIR="out/godot/linux/${BUILD_TYPE}"
+          BIN="$BIN_DIR/AetherKiri.x86_64"
+          if [[ ! -f "$BIN" ]]; then
+            echo "::warning::跳过打包:二进制不存在"
+            exit 0
+          fi
+          cd "$BIN_DIR"
+          ARCHIVE_NAME="AetherKiri-linux-x64-${BUILD_TYPE}.tar.gz"
+          tar -czf "$GITHUB_WORKSPACE/$ARCHIVE_NAME" .
+          cd "$GITHUB_WORKSPACE"
+          ls -lh "$ARCHIVE_NAME"
+          echo "ARCHIVE_PATH=$ARCHIVE_NAME" >> "$GITHUB_ENV"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AetherKiri-linux-x64-${{ inputs.build_type }}
+          path: ${{ env.ARCHIVE_PATH }}
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 上传构建日志
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AetherKiri-linux-x64-build-log
+          path: build-logs/
+          if-no-files-found: ignore
+          retention-days: 3
