@@ -94,6 +94,21 @@ jobs:
           else
             echo "==> Deepin 仓库无 gobjc,跳过(依赖编译前的 OBJC sed 修补)"
           fi
+          # X11 dev 兜底:AetherKiri 的 overlay libgdiplus portfile 在 Linux 上无条件
+          # -DWITH_X11=ON,X11 不是 vcpkg port 是系统库,所以容器里必须有 X11 dev headers
+          # (libx11-dev / libxext-dev / libxrender-dev / libfontconfig1-dev 等)。
+          # 单独 apt + 容错,避免一个包名缺失拖垮全部。
+          if apt-get install -y --no-install-recommends \
+              libx11-dev libxext-dev libxrender-dev libxrandr-dev \
+              libxinerama-dev libxcursor-dev libxi-dev \
+              libfontconfig1-dev libfreetype6-dev \
+              xorg-sgml-doctool xutils-dev \
+              libcairo2-dev libpango1.0-dev libglib2.0-dev; then
+            echo "==> X11 / cairo / pango dev headers 已安装"
+            pkg-config --modversion x11 xext xrender cairo pango 2>&1 | head -10
+          else
+            echo "::warning::X11/cairo dev 部分安装失败,libgdiplus 可能仍需 X11 deps"
+          fi
 
       - name: 检查代码
         uses: actions/checkout@v4
@@ -193,6 +208,15 @@ jobs:
             fi
           else
             echo "::warning::未找到 ${PANGO_PORT},跳过 sed(可能是 vcpkg-configuration.json 未配置 overlay)"
+          fi
+
+          # 兜底:libgdiplus overlay 在 Linux 上硬编 -DWITH_X11=ON,即便装了 X11 dev,
+          # mono-libgdiplus 的 cmake 偶尔也会因为 pthreadstubs / Xrender 找不到而跪。
+          # 关掉 X11 是最后防线(只损失 libgdiplus 的 X11 surface 能力,Godot 视觉小说不依赖)。
+          LIBGDIPLUS_PORT="${GITHUB_WORKSPACE}/vcpkg/ports/libgdiplus/portfile.cmake"
+          if [[ -f "${LIBGDIPLUS_PORT}" ]] && grep -q 'WITH_X11=ON' "${LIBGDIPLUS_PORT}"; then
+            echo "==> libgdiplus overlay 仍硬编 WITH_X11=ON,先按 '已装 X11 dev' 尝试;"
+            echo "    若下一轮仍 BUILD_FAILED,可改为 WITH_X11=OFF 兜底。"
           fi
 
           echo "==> 开始 Linux ${BUILD_TYPE} 编译 (vcpkg 并发=${VCPKG_MAX_CONCURRENCY}, cmake/构建并发=$(nproc))"
