@@ -87,11 +87,16 @@ jobs:
           # 它会清掉 apt 的包索引,提前执行会让后续所有 install 全部 "Unable to locate package"
           # 验证 mono 真装上了(早期发现 apt 镜像里偶尔因依赖解析静默跳过)
           mono --version | head -1
-          # gobjc 兜底:仅 Debian 官方仓库有 gobjc/libgobjc-*-dev,Deepin 仓库可能不收录。
-          # 反正编译前会把 overlay pango portfile 里的 OBJC sed 掉,这里装不上也不阻塞。
+          # gobjc 兜底:Deepin 仓库有 gobjc 包(装的是 gcc 的 ObjC 支持,没有独立的 gobjc 可执行文件,
+          # ObjC 代码要用 gcc -x objective-c 编译),反正编译前还会把 overlay pango 的 OBJC sed 掉。
           if apt-get install -y --no-install-recommends gobjc gobjc++; then
-            echo "==> gobjc 已安装(OBJC 兜底生效)"
-            gobjc --version | head -1
+            echo "==> gobjc 包已安装(OBJC 支持已并入 gcc)"
+            printf 'int main(){return 0;}\n' > /tmp/t.m
+            if gcc -x objective-c /tmp/t.m -o /tmp/t.m.out 2>/dev/null; then
+              echo "==> gcc ObjC 编译自检通过"
+            else
+              echo "::warning::gcc ObjC 编译自检未过,依赖编译前的 OBJC sed 修补"
+            fi
           else
             echo "==> Deepin 仓库无 gobjc,跳过(依赖编译前的 OBJC sed 修补)"
           fi
@@ -200,8 +205,6 @@ jobs:
           echo "==> 编译器版本自检"
           gcc --version | head -1
           g++ --version | head -1
-          # gobjc 在 Deepin 仓库可能不存在,非致命,自检降级为尽力输出
-          which gobjc >/dev/null 2>&1 && gobjc --version | head -1 || echo "(gobjc 不可用,依赖下方 OBJC sed 修补)"
           cmake --version | head -1
           which ninja
           ninja --version
