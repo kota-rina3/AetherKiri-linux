@@ -40,6 +40,13 @@ jobs:
       LC_ALL: C.UTF-8
       BUILD_TYPE: ${{ inputs.build_type }}
 
+    # 关键:Deepin 镜像没设 WORKDIR,run: 步骤默认 CWD 会落到 / 或临时目录,
+    # 导致 git submodule 找不到 .git。强制所有步骤 CWD = workspace
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+        shell: bash
+
     steps:
       - name: 检查代码
         uses: actions/checkout@v4
@@ -69,6 +76,13 @@ jobs:
       - name: 启用子模块(公网回退)
         run: |
           set -euo pipefail
+          # 即使设了 defaults.working-directory,仍显式 cd + 放宽 git 安全检查 + 允许跨 FS 边界
+          cd "${GITHUB_WORKSPACE}"
+          git config --global --add safe.directory '*'
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
+          echo "==> CWD=$(pwd)"
+          ls -la .git 2>&1 | head -5
           # OnscripterYuri 公共子模块
           git submodule update --init --depth 1 packages/OnscripterYuri
           # .gitmodules 中 psdfile 引用 SSH,CI 中强制覆盖为 HTTPS,免去 SSH 部署
