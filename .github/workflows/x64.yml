@@ -32,9 +32,23 @@ jobs:
       AETHERKIRI_ENABLE_INTERNAL: "OFF"
       AETHERKIRI_CACHE_DIR: ${{ github.workspace }}/.aetherkiri-cache
       CCACHE_DIR: ${{ github.workspace }}/.aetherkiri-cache/ccache
+      # ccache 配置:容器 FS 一般不支持 hardlink,改用 fileclone + 放宽 sloppiness
+      CCACHE_FILECLONE: "1"
+      CCACHE_SLOPPINESS: "time_macros,file_macro,include_file_ctime,include_file_mtime,locale,system_headers"
+      CCACHE_UMASK: "002"
       VCPKG_ROOT: ${{ github.workspace }}/.aetherkiri-cache/vcpkg
       VCPKG_DOWNLOADS: ${{ github.workspace }}/.aetherkiri-cache/vcpkg-downloads
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.aetherkiri-cache/vcpkg-binaries
+      # vcpkg 并发限制:vcpkg 默认 MAX_CONCURRENCY=nproc,在 Deepin 容器里会让
+      # 多路 meson/cmake get-vars 同时跑,gcc/c++ 互相抢内存触发 OOM,
+      # 导致 cmake 把"测试编译失败"误报成 CMAKE_C_COMPILER not set
+      VCPKG_MAX_CONCURRENCY: "2"
+      VCPKG_BUILD_TYPE: release
+      # 强制关掉所有 meson port 的 introspection(gobject-introspection 1.0 检测常挂)
+      VCPKG_MESON_CONFIGURE_OPTIONS: "-Dintrospection=disabled"
+      # 给 cmake/meson 一个已知的编译器,别让它瞎探测
+      CC: /usr/bin/gcc
+      CXX: /usr/bin/g++
       DEBIAN_FRONTEND: noninteractive
       LANG: C.UTF-8
       LC_ALL: C.UTF-8
@@ -140,10 +154,18 @@ jobs:
         run: |
           set -euo pipefail
           source tools/linux_env.sh
-          export CMAKE_C_COMPILER_LAUNCHER=ccache
-          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
           chmod +x ./build.sh
-          echo "==> 开始 Linux ${BUILD_TYPE} 编译 ($(nproc) jobs)"
+          echo "==> 编译器版本自检"
+          gcc --version | head -1
+          g++ --version | head -1
+          cmake --version | head -1
+          which ninja
+          ninja --version
+          # 给 ccache 一个 tempdir,避免它在 CCACHE_DIR 之外的任何地方写状态
+          mkdir -p "$RUNNER_TEMP/ccache-tmp"
+          export CCACHE_TEMPDIR="$RUNNER_TEMP/ccache-tmp"
+          echo "==> 开始 Linux ${BUILD_TYPE} 编译 (vcpkg 并发=$(nproc), cmake/构建并发=$(nproc))"
+          # ./build.sh linux release 内部已自带 parallelism 控制
           ./build.sh linux "$BUILD_TYPE" --jobs=$(nproc) 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       - name: ccache 统计
@@ -181,6 +203,37 @@ jobs:
             tail -100 build-logs/build.log
           else
             echo "==> build.log 不存在,跳过日志收集"
+          fi
+
+      - name: 收集 vcpkg buildtrees 日志(失败诊断)
+        if: failure()
+        run: |
+          # 出错时把 vcpkg 内部的 buildtrees/*.log 一并归档,这些是 pango 等子 port
+          # 真正失败细节的所在(主日志只显示一行错误,真正的报错在子日志里)
+          mkdir -p build-logs/vcpkg-buildtrees
+          if [[ -d "${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees" ]]; then
+            find "${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees" \
+              -maxdepth 4 -type f \( -name "*.log" -o -name "*ConfigureLog*" \) \
+              2>/dev/null | head -200 | while read -r f; do
+                rel="${f#${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees/}"
+                mkdir -p "build-logs/vcpkg-buildtrees/$(dirname "$rel")"
+                cp "$f" "build-logs/vcpkg-buildtrees/$rel" || true
+              done
+            echo "==> 收集到 $(find build-logs/vcpkg-buildtrees -type f | wc -l) 个 vcpkg 日志片段"
+          fi
+
+      - name: 收集 cmake 系统探测日志(诊断用)
+        if: failure()
+        run: |
+          # vcpkg 工具链会跑一个微型 cmake 项目探编译器,真正的失败原因在这些 .out.log 里
+          mkdir -p build-logs/cmake-detection
+          if [[ -d "${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees" ]]; then
+            find "${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees" \
+              -type f -name "*-out.log" \
+              2>/dev/null | head -50 | while read -r f; do
+                cp "$f" build-logs/cmake-detection/ 2>/dev/null || true
+              done
+            ls -lh build-logs/cmake-detection/ 2>/dev/null || true
           fi
 
       - name: 打包构建产物
