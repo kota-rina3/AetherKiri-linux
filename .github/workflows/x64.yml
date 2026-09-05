@@ -256,6 +256,46 @@ jobs:
                   print(f"    - {o}")
           PY
 
+      # AetherKiri 的 rust/minori_runtime 是通过 CMake 调用 cargo 编译的 Rust 库:
+      #   rust/minori_runtime/CMakeLists.txt:3  ->  find_program(CARGO_EXECUTABLE cargo)
+      # 流水线一直没装 Rust,Deepin crimson 仓库也没有 cargo / rustc 包,
+      # 必须显式拉 rustup + toolchain,并把 ~/.cargo/bin 注入 $GITHUB_PATH,
+      # 让紧接其后的 cmake configure 能 find_program 命中。
+      # 放在这一步(而不是步骤 1 安装依赖里)的原因:
+      #   dtolnay/rust-toolchain 会自动处理 toolchain 安装、PATH 注入、rustfmt/clippy 等组件,
+      #   把它写在独立步骤里比手卷 rustup 脚本稳定得多,也方便后面对接 Swatinem/rust-cache 按
+      #   Cargo.lock / Cargo.toml 锁版本缓存仓库。
+      - name: 安装 Rust 工具链(cargo 给 rust/minori_runtime 用)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          # AetherKiri 的 rust 端若用了 rustfmt/clippy(典型 workspace 配置),先装上,
+          # 避免 cargo build 触发它们时还要临时下载组件
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo 依赖与编译产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          # rust/minori_runtime 是真正的 crate workspace,默认 cargo target 在 rust/minori_runtime/target;
+          # 同时兼容仓库根目录有个 rust/Cargo.toml 包含 [workspace] 的写法,
+          # rust-cache 找不到对应目录会跳过、不报错。
+          workspaces: |
+            rust -> rust/target
+            rust/minori_runtime -> rust/minori_runtime/target
+          # 用 Lock 锁版本(没 lockfile 时退回到 manifest),避免 CI 里间接依赖飘了导致每次都重编译
+          cache-on-failure: true
+
+      - name: 验证 cargo / rustc 已就绪
+        run: |
+          set -euo pipefail
+          # CMake 的 find_program(CARGO_EXECUTABLE cargo) 默认从 PATH 找;
+          # 没有 cargo,cargo_executable 探测直接跪,rust/minori_runtime 配置阶段就崩。
+          cargo --version
+          rustc --version
+          # 显式打印 PATH 与 cargo 路径,方便排查"装了但 cmake 找不到"的情况
+          echo "==> which cargo: $(command -v cargo)"
+          echo "==> which rustc: $(command -v rustc)"
+
       - name: 编译
         continue-on-error: true
         run: |
