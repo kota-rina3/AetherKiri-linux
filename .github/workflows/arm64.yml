@@ -1,0 +1,571 @@
+name: Linux ARM64 Build (Ubuntu)
+
+on:
+  workflow_dispatch:
+    branches: [master]
+    inputs:
+      build_type:
+        description: 编译类型
+        type: choice
+        required: true
+        default: release
+        options:
+          - release
+          - debug
+
+concurrency:
+  group: linux-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 编译构建
+    runs-on: ubuntu-24.04-arm
+    # 在原生 aarch64 runner 上跑 deepin crimson 容器。
+    # 双层组合:runs-on 给原生 ARM64 硬件 + QEMU-free 性能,container: 给深之琳精简 deb 集合,
+    # 两个一起用,AetherKiri 的构建脚本(vcpkg-cmake-get_vars / overlay portfile sed / mono NuGet)
+    # 在与 x64 流水线相同的 Debian-12-derivate 环境里跑,只是架构变 aarch64。
+    # 镜像在 Docker Hub 已确认存在(linuxdeepin/deepin, tag crimson-arm64-v1.6.0, ~95MB, 2026-04-23 发布)。
+    container: linuxdeepin/deepin:crimson-arm64-v1.6.0
+
+    env:
+      GODOT_RELEASE: 4.7-stable
+      GODOT_TEMPLATE_VERSION: 4.7.stable
+      AETHERKIRI_ENABLE_INTERNAL: "OFF"
+      AETHERKIRI_CACHE_DIR: ${{ github.workspace }}/.aetherkiri-cache
+      CCACHE_DIR: ${{ github.workspace }}/.aetherkiri-cache/ccache
+      # ccache 配置:容器 FS 一般不支持 hardlink,改用 fileclone + 放宽 sloppiness
+      CCACHE_FILECLONE: "1"
+      CCACHE_SLOPPINESS: "time_macros,file_macro,include_file_ctime,include_file_mtime,locale,system_headers"
+      CCACHE_UMASK: "002"
+      VCPKG_ROOT: ${{ github.workspace }}/.aetherkiri-cache/vcpkg
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/.aetherkiri-cache/vcpkg-downloads
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.aetherkiri-cache/vcpkg-binaries
+      # vcpkg 并发限制:vcpkg 默认 MAX_CONCURRENCY=nproc,在 Deepin 容器里会让
+      # 多路 meson/cmake get-vars 同时跑,gcc/c++ 互相抢内存触发 OOM,
+      # 导致 cmake 把"测试编译失败"误报成 CMAKE_C_COMPILER not set
+      VCPKG_MAX_CONCURRENCY: "2"
+      VCPKG_BUILD_TYPE: release
+      # 强制关掉所有 meson port 的 introspection(gobject-introspection 1.0 检测常挂)
+      VCPKG_MESON_CONFIGURE_OPTIONS: "-Dintrospection=disabled"
+      # 编译器路径:不在 job env 硬编码,留空让 PATH 里 gcc/g++ 接管。
+      # 如果步骤 1 装了 gcc-13/g++-13,会通过 $GITHUB_ENV 写入 CC/CXX 覆盖此处。
+      # 这样没装 gcc-13 时也不会指错路,装了又能让后续步骤全用 gcc-13。
+      DEBIAN_FRONTEND: noninteractive
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      BUILD_TYPE: ${{ inputs.build_type }}
+
+    # 关键:Deepin crimson 镜像(无论是 amd64 还是 arm64 变体)都没设 WORKDIR,
+    # run: 步骤默认 CWD 会落到 / 或临时目录,导致 git submodule 找不到 .git。
+    # 强制所有步骤 CWD = workspace —— 与 x64 流水线保持一致的行为。
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+        shell: bash
+
+    steps:
+      - name: 安装所需依赖
+        run: |
+          set -euo pipefail
+          # 架构 sanity check:arm64 流水线必须落在 aarch64 上;若意外被 QEMU 仿真或
+          # runner 调度到 x86_64,会慢 5-10 倍且部分 native 库(尤其 mesa-vulkan-drivers、
+          # gcc-multilib)直接装不上、构建链路到处报莫名错。先 fail-fast。
+          echo "==> 架构自检: $(uname -m) (期望 aarch64)"
+          echo "==> dpkg arch: $(dpkg --print-architecture)"
+          if [[ "$(uname -m)" != "aarch64" ]]; then
+            echo "::error::本流水线设计在原生 aarch64 上运行,当前 $(uname -m)。"
+            echo "::error::请确认 .github/workflows/arm64.yml 的 runs-on 是 ubuntu-24.04-arm。"
+            exit 1
+          fi
+          # 必须在 actions/checkout 之前装 git —— checkout@v4 没 git 会 fallback 到下载 tarball,
+          # 那种模式不下 .git,后续所有 git submodule / git clone vcpkg 都会找不到仓库
+          # mono-complete:vcpkg 的 NuGet 二进制缓存(GitHub Packages)在 Linux 下靠 mono 执行 nuget.exe
+          # gobjc gobjc++:AetherKiri 的 overlay pango portfile 硬编了 LANGUAGES C CXX OBJC,
+          # 即使我们不交叉编译到 darwin,vcpkg_cmake_get_vars 在 Linux 上也必须能探测到 OBJC 编译器才能过
+          apt-get update
+          apt-get install -y --no-install-recommends \
+              build-essential cmake ninja-build pkg-config \
+              autoconf autoconf-archive automake libtool \
+              gettext bison flex curl unzip zip zstd xz-utils \
+              ccache ca-certificates git \
+              nasm yasm \
+              libgl1 libglu1-mesa libasound2 libpulse0 \
+              libxkbcommon0 libwayland-client0 libxrandr2 libxinerama1 \
+              libxcursor1 libxi6 libxext6 libglib2.0-0 \
+              libfontconfig1 libfreetype6 libudev1 libdbus-1-3 \
+              python3 \
+              mono-complete
+          # 注意:rm -rf /var/lib/apt/lists/* 必须放在所有 apt-get install 之后 ——
+          # 它会清掉 apt 的包索引,提前执行会让后续所有 install 全部 "Unable to locate package"
+          # 验证 mono 真装上了(早期发现 apt 镜像里偶尔因依赖解析静默跳过)
+          mono --version | head -1
+          # gobjc 兜底:Deepin 仓库有 gobjc 包(装的是 gcc 的 ObjC 支持,没有独立的 gobjc 可执行文件,
+          # ObjC 代码要用 gcc -x objective-c 编译),反正编译前还会把 overlay pango 的 OBJC sed 掉。
+          if apt-get install -y --no-install-recommends gobjc gobjc++; then
+            echo "==> gobjc 包已安装(OBJC 支持已并入 gcc)"
+            printf 'int main(){return 0;}\n' > /tmp/t.m
+            if gcc -x objective-c /tmp/t.m -o /tmp/t.m.out 2>/dev/null; then
+              echo "==> gcc ObjC 编译自检通过"
+            else
+              echo "::warning::gcc ObjC 编译自检未过,依赖编译前的 OBJC sed 修补"
+            fi
+          else
+            echo "==> Deepin 仓库无 gobjc,跳过(依赖编译前的 OBJC sed 修补)"
+          fi
+          # X11 dev 兜底:AetherKiri 的 overlay libgdiplus portfile 在 Linux 上无条件
+          # -DWITH_X11=ON,X11 不是 vcpkg port 是系统库,所以容器里必须有 X11 dev headers。
+          # 教训:不能把一堆包装进一条 apt-get install —— Deepin 仓库缺任何一个包名都会
+          # 导致整条命令失败、全军覆没(和 gobjc 一样的坑),所以逐个装、缺哪个跳哪个。
+          X11_PKGS="libx11-dev libxext-dev libxrender-dev libxrandr-dev \
+                    libxinerama-dev libxcursor-dev libxi-dev libxau-dev libxdmcp-dev \
+                    libxcb1-dev libpthread-stubs-dev \
+                    libfontconfig1-dev libfreetype6-dev \
+                    libcairo2-dev libpango1.0-dev libglib2.0-dev"
+          FAILED_PKGS=""
+          for p in $X11_PKGS; do
+            if apt-get install -y --no-install-recommends "$p" >/dev/null 2>&1; then
+              echo "  [ok]   $p"
+            else
+              echo "  [miss] $p  (Deepin 仓库未收录,跳过)"
+              FAILED_PKGS="$FAILED_PKGS $p"
+            fi
+          done
+          if [[ -n "$FAILED_PKGS" ]]; then
+            echo "::warning::以下 X11/cairo dev 包未装上:$FAILED_PKGS"
+          fi
+          # 关键自检:x11 + xrender 是 libgdiplus WITH_X11=ON 的硬需求
+          if pkg-config --exists x11 && pkg-config --exists xrender; then
+            echo "==> pkg-config x11/xrender 自检通过:"
+            pkg-config --modversion x11 xrender
+          else
+            echo "::error::pkg-config 找不到 x11 或 xrender,libgdiplus 的 find_package(X11 REQUIRED) 必挂"
+            exit 1
+          fi
+          # gcc-13/g++-13 兜底:vcpkg baseline 默认 openal-soft 1.25.1 使用 C++20 <format> 头,
+          # GCC 12.x libstdc++ 不提供 <format>,编译会 `fatal error: format: No such file`。
+          # 装不上不阻塞 —— vcpkg.json override (下一步)会把 openal-soft 钉到 1.23.1(fmt 仍 vendored)。
+          if apt-get install -y --no-install-recommends gcc-13 g++-13 >/dev/null 2>&1; then
+            echo "==> gcc-13/g++-13 已装,设为默认编译器"
+            if command -v update-alternatives >/dev/null 2>&1; then
+              update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 2>/dev/null || true
+              update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 2>/dev/null || true
+            fi
+            # 让后续步骤(vcpkg/Godot 主代码)都用 gcc-13
+            echo "CC=/usr/bin/gcc-13"  >> "$GITHUB_ENV"
+            echo "CXX=/usr/bin/g++-13" >> "$GITHUB_ENV"
+            gcc --version | head -1
+            g++ --version | head -1
+          else
+            echo "::warning::Deepin 仓库无 gcc-13/g++-13,继续用 GCC 12 —— openal-soft 1.23.1(fmt vendored)兼容"
+          fi
+          # 所有 apt 安装完成后再清包索引(省磁盘;提前清会让后续 install 全部失败)
+          rm -rf /var/lib/apt/lists/*
+
+      - name: 检查代码
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 启用子模块(公网回退)
+        run: |
+          set -euo pipefail
+          # 即使设了 defaults.working-directory,仍显式 cd + 放宽 git 安全检查 + 允许跨 FS 边界
+          cd "${GITHUB_WORKSPACE}"
+          git config --global --add safe.directory '*'
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
+          echo "==> CWD=$(pwd)"
+          ls -la .git 2>&1 | head -5
+          # OnscripterYuri 公共子模块
+          git submodule update --init --depth 1 packages/OnscripterYuri
+          # .gitmodules 中 psdfile 引用 SSH,CI 中强制覆盖为 HTTPS,免去 SSH 部署
+          git -c submodule.packages/psdfile.url=https://github.com/AetherKiri/psdfile.git \
+              submodule update --init --recursive --depth 1 packages/psdfile
+
+      - name: 缓存工具链与下载
+        uses: actions/cache@v4
+        with:
+          path: |
+            .aetherkiri-cache/godot
+            .aetherkiri-cache/downloads
+            .aetherkiri-cache/vcpkg
+            .aetherkiri-cache/system-tools
+          key: linux-arm64-cache-v1-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', '.github/workflows/arm64.yml') }}
+          restore-keys: |
+            linux-arm64-cache-v1-${{ runner.os }}-
+
+      - name: 安装模块
+        run: |
+          set -euo pipefail
+          # 自动克隆并 bootstrap vcpkg、下载 Godot 4.7-stable 与 export templates
+          bash tools/setup_linux.sh
+
+      - name: 配置 ccache
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache --max-size=2G
+          ccache -z
+
+      - name: 配置 vcpkg 二进制缓存
+        env:
+          VCPKG_PACKAGES_TOKEN: ${{ github.token }}
+        run: |
+          set +e  # 本步骤不致命:缓存连不上最多让首次构建慢一点,不该拖垮整个流水线
+          # 复用上游脚本,接入 GitHub Packages 缓存,大幅加速重复构建
+          if [[ -f .github/scripts/configure-vcpkg-binary-cache.sh ]]; then
+            echo "==> 尝试配置 vcpkg NuGet 二进制缓存(GitHub Packages)"
+            bash .github/scripts/configure-vcpkg-binary-cache.sh "$VCPKG_ROOT/vcpkg"
+            rc=$?
+            if [[ $rc -ne 0 ]]; then
+              echo "::warning::vcpkg 二进制缓存配置失败(rc=$rc),将仅使用本地编译,继续构建"
+            fi
+          else
+            echo "::notice::未找到 vcpkg 二进制缓存脚本,跳过(继续构建)"
+          fi
+
+      - name: 钉住 vcpkg 端口版本(GCC 12 兼容)
+        env:
+          VCPKG_JSON_PATH: ${{ github.workspace }}/vcpkg.json
+        run: |
+          # vcpkg baseline 默认的 openal-soft 1.25.1 使用 C++20 <format> 头,
+          # GCC 12.x libstdc++ 不提供 <format>。修法:钉到 1.23.1 —— 这个版本 fmt 仍 vendored,
+          # 无需 <format>,可在 GCC 12 下顺利编出。封装成永久 override 后,
+          # 后续即使 vcpkg baseline 升到 1.30.x,本仓库也始终用 1.23.1。
+          #
+          # 本步骤做两件事:(1) 若文件有 openal-soft override,尊重之;(2) 否则追加钉版。
+          # 同时利用 hashFiles(已在缓存 key 里)自动让缓存重建,无副作用。
+          if [[ ! -f "${VCPKG_JSON_PATH}" ]]; then
+            echo "::notice::未找到 vcpkg.json,跳过(可能用了 vcpkg-configuration.json 自定义 baseline)"
+            exit 0
+          fi
+          python3 - "${VCPKG_JSON_PATH}" <<'PY'
+          import json, sys, os
+          fp = sys.argv[1]
+          with open(fp, 'r', encoding='utf-8') as f:
+              doc = json.load(f)
+          overrides = doc.get('overrides', []) or []
+          user_pinned = [o for o in overrides if o.get('name') == 'openal-soft']
+          overrides = [o for o in overrides if o.get('name') != 'openal-soft']
+          if user_pinned:
+              pinned = user_pinned[0]
+              src = "用户原有 override"
+          else:
+              pinned = {"name": "openal-soft", "version": "1.23.1"}
+              src = "CI 自动追加"
+          overrides.append(pinned)
+          doc['overrides'] = overrides
+          tmp = fp + '.tmp'
+          with open(tmp, 'w', encoding='utf-8') as f:
+              json.dump(doc, f, indent=2, ensure_ascii=False)
+              f.write('\n')
+          os.replace(tmp, fp)
+          print(f"[ok] openal-soft 已钉版 ({src}): {pinned}")
+          print("==> 当前 vcpkg.json overrides 段:")
+          with open(fp, 'r', encoding='utf-8') as f:
+              for o in json.load(f).get('overrides', []):
+                  print(f"    - {o}")
+          PY
+
+      # AetherKiri 的 rust/minori_runtime 是通过 CMake 调用 cargo 编译的 Rust 库:
+      #   rust/minori_runtime/CMakeLists.txt:3  ->  find_program(CARGO_EXECUTABLE cargo)
+      # 流水线一直没装 Rust,Deepin crimson 仓库也没有 cargo / rustc 包,
+      # 必须显式拉 rustup + toolchain,并把 ~/.cargo/bin 注入 $GITHUB_PATH,
+      # 让紧接其后的 cmake configure 能 find_program 命中。
+      # 放在这一步(而不是步骤 1 安装依赖里)的原因:
+      #   dtolnay/rust-toolchain 会自动处理 toolchain 安装、PATH 注入、rustfmt/clippy 等组件,
+      #   把它写在独立步骤里比手卷 rustup 脚本稳定得多,也方便后面对接 Swatinem/rust-cache 按
+      #   Cargo.lock / Cargo.toml 锁版本缓存仓库。
+      - name: 安装 Rust 工具链(cargo 给 rust/minori_runtime 用)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          # AetherKiri 的 rust 端若用了 rustfmt/clippy(典型 workspace 配置),先装上,
+          # 避免 cargo build 触发它们时还要临时下载组件
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo 依赖与编译产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          # rust/minori_runtime 是真正的 crate workspace,默认 cargo target 在 rust/minori_runtime/target;
+          # 同时兼容仓库根目录有个 rust/Cargo.toml 包含 [workspace] 的写法,
+          # rust-cache 找不到对应目录会跳过、不报错。
+          workspaces: |
+            rust -> rust/target
+            rust/minori_runtime -> rust/minori_runtime/target
+          # 用 Lock 锁版本(没 lockfile 时退回到 manifest),避免 CI 里间接依赖飘了导致每次都重编译
+          cache-on-failure: true
+
+      - name: 验证 cargo / rustc 已就绪
+        run: |
+          set -euo pipefail
+          # CMake 的 find_program(CARGO_EXECUTABLE cargo) 默认从 PATH 找;
+          # 没有 cargo,cargo_executable 探测直接跪,rust/minori_runtime 配置阶段就崩。
+          cargo --version
+          rustc --version
+          # 显式打印 PATH 与 cargo 路径,方便排查"装了但 cmake 找不到"的情况
+          echo "==> which cargo: $(command -v cargo)"
+          echo "==> which rustc: $(command -v rustc)"
+
+      - name: 兜底刷新 CA bundle 并预下载 SSL 重难搞的 vcpkg 源
+        run: |
+          # vcpkg 自带的 libcurl 在 deepin crimson 容器里 SSL handshake 偶发失败:
+          #   error: curl operation failed with error code 35 (CURLE_SSL_CONNECT_ERROR)
+          # 出现在 vcpkg_from_gitlab(下载 gitlab.freedesktop.org 上的 uchardet-v0.0.8.tar.gz),
+          # 根因大概率是容器 openssl/libssl3 与 gitlab.freedesktop.org 的 cloudflare CDN 协商不上
+          # (cipher / intermediate CA / SNI 任一撞上都会回 error 35),vcpkg 也没提供 retry 钩子。
+          #
+          # 修法(在 vcpkg install 真正发起之前主动抢一遍):
+          #   (1) 重装系统 ca-certificates + update-ca-certificates,fresh CA bundle
+          #   (2) 用系统 curl 走 --retry 5 重试,把 tarball 落到 $VCPKG_DOWNLOADS/
+          #   (3) vcpkg_download_distfile.cmake 会先 EXISTS $DOWNLOADS/$FILENAME;命中且 SHA
+          #       匹配直接 return,绕过其内部 curl 这个 SSL 不稳的代码路径
+          # 不通过 vcpkg.json overrides 钉 uchardet 老版本是因为 AetherKiri 的 vcpkg-configuration.json
+          # 用 versioning baseline 钉了 v0.0.8,改 manifest 风险高;此处仅做"下载预热"。
+          set -euo pipefail
+          # (1) CA bundle 刷新:deepin crimson 的 ca-certificates 有时撞 intermediate CA 临期
+          apt-get install -y --no-install-recommends --reinstall ca-certificates openssl >/dev/null 2>&1 || true
+          update-ca-certificates 2>/dev/null || true
+          # 让 libssl / libcurl 能重新读取新的 CA bundle(部分发行版需要手动 ldconfig,deepin 通常无需)
+          ldconfig 2>/dev/null || true
+          mkdir -p "$VCPKG_DOWNLOADS"
+
+          # (2) 已知 SSL 重难搞源短名单 —— 仅登记 vcpkg install 主路径上、且 gitlab.freedesktop.org / 类似
+          # 老牌 GitLab 上托管的 port;按需追加。key 是落盘到 $VCPKG_DOWNLOADS 的文件名(与 vcpkg portfile
+          # 里的 _basename.tar.gz 一致),value 是源 URL。
+          declare -A TRICKY_SOURCES=(
+            [uchardet-uchardet-v0.0.8.tar.gz]="https://gitlab.freedesktop.org/uchardet/uchardet/-/archive/v0.0.8/uchardet-v0.0.8.tar.gz"
+          )
+
+          for filename in "${!TRICKY_SOURCES[@]}"; do
+            url="${TRICKY_SOURCES[$filename]}"
+            dest="$VCPKG_DOWNLOADS/$filename"
+            if [[ -s "$dest" ]]; then
+              sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+              echo "==> 已存在: $dest ($sz bytes),跳过"
+              continue
+            fi
+            echo "==> 预下载: $url → $dest"
+            # 优先走系统 curl(--retry + 长 timeout)。若失败再退回 python3 urllib(Python SSL stack
+            # 独立于系统的 libssl,某些 deepin 镜像里反而能拿到 tls 协商结果),两条都失败就让 vcpkg
+            # 自己再尝试 —— 至少我们把诊断输出留下了。
+            ok=0
+            if command -v curl >/dev/null 2>&1; then
+              if curl -fSL --retry 5 --retry-delay 3 --connect-timeout 30 --max-time 900 \
+                    --proto '=https' \
+                    -o "$dest.tmp" "$url" 2>&1 | tail -5; then
+                if [[ -s "$dest.tmp" ]]; then
+                  mv "$dest.tmp" "$dest"
+                  ok=1
+                fi
+              fi
+              rm -f "$dest.tmp" || true
+            fi
+            if [[ $ok -eq 0 ]] && command -v python3 >/dev/null 2>&1; then
+              echo "==> curl 路径失败,改 python3 urllib 兜底"
+              # 用 python3 -c '...' 替代 <<'PY' heredoc。原因:GitHub Actions 把 YAML `run: |` 块
+              # 转成 .sh 时,只按"块基缩进"统一去缩进而**不会重新对齐 heredoc 终止符**。
+              # 老 step(`钉住 vcpkg 端口版本`)的 PY 恰好在基缩进位置上、第 0 列结束 heredoc;
+              # 这里我们的 heredoc 嵌在 `if ... then` 里(多缩了 4 层),PY 落到第 4 列 → bash 永远
+              # 找不到终止符 → `delimited by end-of-file (wanted 'PY')` → exit 2。
+              # bash 单引号包裹下 python 代码原样转交:无 `$` 展开、无反引号解释,f-string / 双引号字符串也安全。
+              # 注意:python 每行仍须 ≥ 14 空格前缀以满足 YAML 字面块规则,被 de-indent 后回到 0 列,python 能正常解析。
+              if python3 -c '
+              import urllib.request, ssl, sys
+              url, dst = sys.argv[1], sys.argv[2]
+              ctx = ssl.create_default_context()
+              try:
+                  with urllib.request.urlopen(url, context=ctx, timeout=600) as r:
+                      open(dst, "wb").write(r.read())
+                  print("python3 urllib 成功")
+              except Exception as e:
+                  print(f"python3 urllib 失败: {e}", file=sys.stderr)
+                  sys.exit(1)
+              ' "$url" "$dest.tmp" 2>&1 | tail -10; then
+                if [[ -s "$dest.tmp" ]]; then
+                  mv "$dest.tmp" "$dest"
+                  ok=1
+                fi
+              fi
+              rm -f "$dest.tmp" || true
+            fi
+            if [[ $ok -eq 1 ]]; then
+              sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+              sha=$(sha512sum "$dest" 2>/dev/null | awk '{print $1}')
+              echo "==> 成功: $dest ($sz bytes, sha512=$sha)"
+            else
+              echo "::warning::预下载失败: $url —— 让 vcpkg 自带 curl 自己再试一次"
+            fi
+          done
+
+      - name: 编译
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          source tools/linux_env.sh
+          chmod +x ./build.sh
+          echo "==> 编译器版本自检"
+          gcc --version | head -1
+          g++ --version | head -1
+          cmake --version | head -1
+          which ninja
+          ninja --version
+          # 给 ccache 一个 tempdir,避免它在 CCACHE_DIR 之外的任何地方写状态
+          mkdir -p "$RUNNER_TEMP/ccache-tmp"
+          export CCACHE_TEMPDIR="$RUNNER_TEMP/ccache-tmp"
+
+          # AetherKiri 的 overlay pango portfile 硬编了 LANGUAGES C CXX OBJC,
+          # 这个是为 darwin 交叉编译准备的,但在 Linux native 容器里会让
+          # vcpkg_cmake_get_vars 在探测 OBJC 编译器时反复跪(meson build 不需要,但 cmake 必须能成功探测)。
+          # 我们 Linux 编译用不到 darwin,直接把 OBJC 摘掉,既不会破坏 pango 的构建(meson.build 里 OBJ-C 代码
+          # 是 if host_machine.system() == 'darwin' 才编),又能彻底避开容器里没 gobjc 的尴尬。
+          PANGO_PORT="${GITHUB_WORKSPACE}/vcpkg/ports/pango/portfile.cmake"
+          if [[ -f "${PANGO_PORT}" ]]; then
+            if grep -q 'LANGUAGES C CXX OBJC' "${PANGO_PORT}"; then
+              sed -i 's/LANGUAGES C CXX OBJC/LANGUAGES C CXX/' "${PANGO_PORT}"
+              echo "==> 已为 Linux 移除 pango overlay 的 OBJC,新内容:"
+              grep -n 'LANGUAGES' "${PANGO_PORT}" || true
+            else
+              echo "==> pango overlay 已经没有 OBJC,跳过"
+            fi
+          else
+            echo "::warning::未找到 ${PANGO_PORT},跳过 sed(可能是 vcpkg-configuration.json 未配置 overlay)"
+          fi
+
+          # 兜底:libgdiplus overlay 在 Linux 上硬编 -DWITH_X11=ON,即便装了 X11 dev,
+          # mono-libgdiplus 的 cmake 偶尔也会因为 pthreadstubs / Xrender 找不到而跪。
+          # 关掉 X11 是最后防线(只损失 libgdiplus 的 X11 surface 能力,Godot 视觉小说不依赖)。
+          LIBGDIPLUS_PORT="${GITHUB_WORKSPACE}/vcpkg/ports/libgdiplus/portfile.cmake"
+          if [[ -f "${LIBGDIPLUS_PORT}" ]] && grep -q 'WITH_X11=ON' "${LIBGDIPLUS_PORT}"; then
+            echo "==> libgdiplus overlay 仍硬编 WITH_X11=ON,先按 '已装 X11 dev' 尝试;"
+            echo "    若下一轮仍 BUILD_FAILED,可改为 WITH_X11=OFF 兜底。"
+          fi
+
+          echo "==> 开始 Linux ${BUILD_TYPE} 编译 (vcpkg 并发=${VCPKG_MAX_CONCURRENCY}, cmake/构建并发=$(nproc))"
+          # ./build.sh linux release 内部已自带 parallelism 控制
+          ./build.sh linux "$BUILD_TYPE" --jobs=$(nproc) 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: ccache 统计
+        if: always()
+        run: |
+          echo "==> ccache 统计"
+          ccache -s || true
+
+      - name: 校验构建产物
+        if: always()
+        run: |
+          set -euo pipefail
+          BIN_DIR="out/godot/linux/${BUILD_TYPE}"
+          BIN="$BIN_DIR/AetherKiri.arm64"
+          if [[ -f "$BIN" ]]; then
+            echo "==> 二进制存在"
+            ls -lh "$BIN"
+            file "$BIN"
+            echo "==> 共享库依赖(前 30 行)"
+            ldd "$BIN" | head -30
+            echo "==> 完整产物清单"
+            ls -lh "$BIN_DIR"
+          else
+            echo "::error::构建产物未生成:$BIN"
+            exit 1
+          fi
+
+      - name: 收集构建日志
+        if: always()
+        run: |
+          mkdir -p build-logs
+          if [[ -f "$RUNNER_TEMP/build.log" ]]; then
+            cp "$RUNNER_TEMP/build.log" build-logs/build.log
+            echo "==> 构建日志尾部(最后 100 行)"
+            tail -100 build-logs/build.log
+          else
+            echo "==> build.log 不存在,跳过日志收集"
+          fi
+          # 把 vcpkg 每个 port 的 config-*-out.log 直接打到控制台:
+          # vcpkg 的 BUILD_FAILED 主日志只有一行,真实报错都在 buildtrees/<port>/ 下。
+          # 这里直接在 Actions 日志里展开,免去翻 artifact。
+          BT="${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees"
+          if [[ -d "$BT" ]]; then
+            find "$BT" -maxdepth 2 -type f -name "config-*-out.log" 2>/dev/null | sort | while read -r f; do
+              rel="${f#$BT/}"
+              # 只打最近 1 小时内修改过的(即本次运行产生的),避免缓存里的旧日志刷屏
+              if [[ -n "$(find "$f" -mmin -60 2>/dev/null)" ]]; then
+                echo ""
+                echo "=============================================="
+                echo "==> vcpkg configure 日志: $rel (尾部 80 行)"
+                echo "=============================================="
+                tail -80 "$f" || true
+              fi
+            done
+          fi
+
+      - name: 收集 vcpkg buildtrees 日志(失败诊断)
+        if: failure()
+        run: |
+          # 出错时把 vcpkg 内部的 buildtrees/*.log 一并归档,这些是 pango 等子 port
+          # 真正失败细节的所在(主日志只显示一行错误,真正的报错在子日志里)
+          mkdir -p build-logs/vcpkg-buildtrees
+          if [[ -d "${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees" ]]; then
+            find "${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees" \
+              -maxdepth 4 -type f \( -name "*.log" -o -name "*ConfigureLog*" \) \
+              2>/dev/null | head -200 | while read -r f; do
+                rel="${f#${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees/}"
+                mkdir -p "build-logs/vcpkg-buildtrees/$(dirname "$rel")"
+                cp "$f" "build-logs/vcpkg-buildtrees/$rel" || true
+              done
+            echo "==> 收集到 $(find build-logs/vcpkg-buildtrees -type f | wc -l) 个 vcpkg 日志片段"
+          fi
+
+      - name: 收集 cmake 系统探测日志(诊断用)
+        if: failure()
+        run: |
+          # vcpkg 工具链会跑一个微型 cmake 项目探编译器,真正的失败原因在这些 .out.log 里
+          mkdir -p build-logs/cmake-detection
+          if [[ -d "${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees" ]]; then
+            find "${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees" \
+              -type f -name "*-out.log" \
+              2>/dev/null | head -50 | while read -r f; do
+                cp "$f" build-logs/cmake-detection/ 2>/dev/null || true
+              done
+            ls -lh build-logs/cmake-detection/ 2>/dev/null || true
+          fi
+
+      - name: 打包构建产物
+        if: always()
+        run: |
+          set -euo pipefail
+          BIN_DIR="out/godot/linux/${BUILD_TYPE}"
+          BIN="$BIN_DIR/AetherKiri.arm64"
+          if [[ ! -f "$BIN" ]]; then
+            echo "::warning::跳过打包:二进制不存在"
+            exit 0
+          fi
+          cd "$BIN_DIR"
+          ARCHIVE_NAME="AetherKiri-linux-arm64-${BUILD_TYPE}.tar.gz"
+          tar -czf "$GITHUB_WORKSPACE/$ARCHIVE_NAME" .
+          cd "$GITHUB_WORKSPACE"
+          ls -lh "$ARCHIVE_NAME"
+          echo "ARCHIVE_PATH=$ARCHIVE_NAME" >> "$GITHUB_ENV"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AetherKiri-linux-arm64-${{ inputs.build_type }}
+          path: ${{ env.ARCHIVE_PATH }}
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 上传构建日志
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AetherKiri-linux-arm64-build-log
+          path: build-logs/
+          if-no-files-found: ignore
+          retention-days: 3
