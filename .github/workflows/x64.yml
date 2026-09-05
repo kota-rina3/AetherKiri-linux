@@ -296,6 +296,91 @@ jobs:
           echo "==> which cargo: $(command -v cargo)"
           echo "==> which rustc: $(command -v rustc)"
 
+      - name: 兜底刷新 CA bundle 并预下载 SSL 重难搞的 vcpkg 源
+        run: |
+          # vcpkg 自带的 libcurl 在 deepin crimson 容器里 SSL handshake 偶发失败:
+          #   error: curl operation failed with error code 35 (CURLE_SSL_CONNECT_ERROR)
+          # 出现在 vcpkg_from_gitlab(下载 gitlab.freedesktop.org 上的 uchardet-v0.0.8.tar.gz),
+          # 根因大概率是容器 openssl/libssl3 与 gitlab.freedesktop.org 的 cloudflare CDN 协商不上
+          # (cipher / intermediate CA / SNI 任一撞上都会回 error 35),vcpkg 也没提供 retry 钩子。
+          #
+          # 修法(在 vcpkg install 真正发起之前主动抢一遍):
+          #   (1) 重装系统 ca-certificates + update-ca-certificates,fresh CA bundle
+          #   (2) 用系统 curl 走 --retry 5 重试,把 tarball 落到 $VCPKG_DOWNLOADS/
+          #   (3) vcpkg_download_distfile.cmake 会先 EXISTS $DOWNLOADS/$FILENAME;命中且 SHA
+          #       匹配直接 return,绕过其内部 curl 这个 SSL 不稳的代码路径
+          # 不通过 vcpkg.json overrides 钉 uchardet 老版本是因为 AetherKiri 的 vcpkg-configuration.json
+          # 用 versioning baseline 钉了 v0.0.8,改 manifest 风险高;此处仅做"下载预热"。
+          set -euo pipefail
+          # (1) CA bundle 刷新:deepin crimson 的 ca-certificates 有时撞 intermediate CA 临期
+          apt-get install -y --no-install-recommends --reinstall ca-certificates openssl >/dev/null 2>&1 || true
+          update-ca-certificates 2>/dev/null || true
+          # 让 libssl / libcurl 能重新读取新的 CA bundle(部分发行版需要手动 ldconfig,deepin 通常无需)
+          ldconfig 2>/dev/null || true
+          mkdir -p "$VCPKG_DOWNLOADS"
+
+          # (2) 已知 SSL 重难搞源短名单 —— 仅登记 vcpkg install 主路径上、且 gitlab.freedesktop.org / 类似
+          # 老牌 GitLab 上托管的 port;按需追加。key 是落盘到 $VCPKG_DOWNLOADS 的文件名(与 vcpkg portfile
+          # 里的 _basename.tar.gz 一致),value 是源 URL。
+          declare -A TRICKY_SOURCES=(
+            [uchardet-uchardet-v0.0.8.tar.gz]="https://gitlab.freedesktop.org/uchardet/uchardet/-/archive/v0.0.8/uchardet-v0.0.8.tar.gz"
+          )
+
+          for filename in "${!TRICKY_SOURCES[@]}"; do
+            url="${TRICKY_SOURCES[$filename]}"
+            dest="$VCPKG_DOWNLOADS/$filename"
+            if [[ -s "$dest" ]]; then
+              sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+              echo "==> 已存在: $dest ($sz bytes),跳过"
+              continue
+            fi
+            echo "==> 预下载: $url → $dest"
+            # 优先走系统 curl(--retry + 长 timeout)。若失败再退回 python3 urllib(Python SSL stack
+            # 独立于系统的 libssl,某些 deepin 镜像里反而能拿到 tls 协商结果),两条都失败就让 vcpkg
+            # 自己再尝试 —— 至少我们把诊断输出留下了。
+            ok=0
+            if command -v curl >/dev/null 2>&1; then
+              if curl -fSL --retry 5 --retry-delay 3 --connect-timeout 30 --max-time 900 \
+                    --proto '=https' \
+                    -o "$dest.tmp" "$url" 2>&1 | tail -5; then
+                if [[ -s "$dest.tmp" ]]; then
+                  mv "$dest.tmp" "$dest"
+                  ok=1
+                fi
+              fi
+              rm -f "$dest.tmp" || true
+            fi
+            if [[ $ok -eq 0 ]] && command -v python3 >/dev/null 2>&1; then
+              echo "==> curl 路径失败,改 python3 urllib 兜底"
+              if python3 - "$url" "$dest.tmp" <<'PY' 2>&1 | tail -10; then
+                  import urllib.request, ssl, sys
+                  url, dst = sys.argv[1], sys.argv[2]
+                  ctx = ssl.create_default_context()
+                  try:
+                      with urllib.request.urlopen(url, context=ctx, timeout=600) as r:
+                          with open(dst, 'wb') as f:
+                              f.write(r.read())
+                      print('python3 urllib 成功')
+                  except Exception as e:
+                      print(f'python3 urllib 失败: {e}', file=sys.stderr)
+                      sys.exit(1)
+              PY
+                if [[ -s "$dest.tmp" ]]; then
+                  mv "$dest.tmp" "$dest"
+                  ok=1
+                fi
+              fi
+              rm -f "$dest.tmp" || true
+            fi
+            if [[ $ok -eq 1 ]]; then
+              sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+              sha=$(sha512sum "$dest" 2>/dev/null | awk '{print $1}')
+              echo "==> 成功: $dest ($sz bytes, sha512=$sha)"
+            else
+              echo "::warning::预下载失败: $url —— 让 vcpkg 自带 curl 自己再试一次"
+            fi
+          done
+
       - name: 编译
         continue-on-error: true
         run: |
