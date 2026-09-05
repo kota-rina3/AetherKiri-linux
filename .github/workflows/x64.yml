@@ -352,19 +352,25 @@ jobs:
             fi
             if [[ $ok -eq 0 ]] && command -v python3 >/dev/null 2>&1; then
               echo "==> curl 路径失败,改 python3 urllib 兜底"
-              if python3 - "$url" "$dest.tmp" <<'PY' 2>&1 | tail -10; then
-                  import urllib.request, ssl, sys
-                  url, dst = sys.argv[1], sys.argv[2]
-                  ctx = ssl.create_default_context()
-                  try:
-                      with urllib.request.urlopen(url, context=ctx, timeout=600) as r:
-                          with open(dst, 'wb') as f:
-                              f.write(r.read())
-                      print('python3 urllib 成功')
-                  except Exception as e:
-                      print(f'python3 urllib 失败: {e}', file=sys.stderr)
-                      sys.exit(1)
-              PY
+              # 用 python3 -c '...' 替代 <<'PY' heredoc。原因:GitHub Actions 把 YAML `run: |` 块
+              # 转成 .sh 时,只按"块基缩进"统一去缩进而**不会重新对齐 heredoc 终止符**。
+              # 老 step(`钉住 vcpkg 端口版本`)的 PY 恰好在基缩进位置上、第 0 列结束 heredoc;
+              # 这里我们的 heredoc 嵌在 `if ... then` 里(多缩了 4 层),PY 落到第 4 列 → bash 永远
+              # 找不到终止符 → `delimited by end-of-file (wanted 'PY')` → exit 2。
+              # bash 单引号包裹下 python 代码原样转交:无 `$` 展开、无反引号解释,f-string / 双引号字符串也安全。
+              # 注意:python 每行仍须 ≥ 14 空格前缀以满足 YAML 字面块规则,被 de-indent 后回到 0 列,python 能正常解析。
+              if python3 -c '
+              import urllib.request, ssl, sys
+              url, dst = sys.argv[1], sys.argv[2]
+              ctx = ssl.create_default_context()
+              try:
+                  with urllib.request.urlopen(url, context=ctx, timeout=600) as r:
+                      open(dst, "wb").write(r.read())
+                  print("python3 urllib 成功")
+              except Exception as e:
+                  print(f"python3 urllib 失败: {e}", file=sys.stderr)
+                  sys.exit(1)
+              ' "$url" "$dest.tmp" 2>&1 | tail -10; then
                 if [[ -s "$dest.tmp" ]]; then
                   mv "$dest.tmp" "$dest"
                   ok=1
