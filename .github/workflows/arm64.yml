@@ -1,4 +1,4 @@
-name: Linux ARM64 Build (Ubuntu)
+name: Linux ARM64 Build (Deepin)
 
 on:
   workflow_dispatch:
@@ -187,6 +187,74 @@ jobs:
           # .gitmodules 中 psdfile 引用 SSH,CI 中强制覆盖为 HTTPS,免去 SSH 部署
           git -c submodule.packages/psdfile.url=https://github.com/AetherKiri/psdfile.git \
               submodule update --init --recursive --depth 1 packages/psdfile
+
+      # 关键适配 step: AetherKiri-linux 上游目前只支持 Linux x86_64,硬编了 .x86_64 /
+      # x64-linux 等 arch-specific 字符串到 6 个项目文件里。本 step 在 checkout 之后、
+      # setup_linux.sh 下载 Godot 之前,把全部硬编批量 sed-patch 成 arm64 等价物。
+      # 这不是项目原生支持的 arm64 构建,但能就地把它跑通。
+      # 触发点 grep 串全用 arm64 字面量,确保幂等:已经改过的再 sed 一次也不会重复 patch。
+      - name: 项目 ARM64 适配(上游仅支持 x86_64,sed-patch 6 个文件)
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          echo "==> ARM64 适配前 grep 自检(应能看到若干 x86_64 / x64-linux 残留):"
+          grep -nE 'x86_64|x64-linux' \
+              CMakePresets.json \
+              tools/setup_linux.sh \
+              tools/linux_env.sh \
+              build/build_linux.sh \
+              apps/godot_app/export_presets.cfg \
+              apps/godot_app/aether_kiri.gdextension 2>&1 | head -20 || true
+
+          # 1. CMakePresets.json —— 把 Linux preset 的 vcpkg triplet 从 x64-linux 改成 arm64-linux。
+          #    这是当前 cmake 报 "Detecting compiler hash for triplet x64-linux" 的根因。
+          sed -i 's|"VCPKG_TARGET_TRIPLET": "x64-linux"|"VCPKG_TARGET_TRIPLET": "arm64-linux"|' CMakePresets.json
+          echo "==> [1/6] CMakePresets.json: VCPKG_TARGET_TRIPLET 已改为 arm64-linux"
+
+          # 2. tools/setup_linux.sh —— Godot 二进制下载 URL 和本地归档名都含 linux.x86_64.zip,
+          #    一行 sed 覆盖 URL + 本地文件名两处。归档内是 Godot 4.7-stable_linux.arm64 二进制。
+          sed -i 's|linux\.x86_64\.zip|linux.arm64.zip|g' tools/setup_linux.sh
+          echo "==> [2/6] tools/setup_linux.sh: Godot 下载 URL 已改为 linux.arm64.zip"
+
+          # 3. tools/linux_env.sh —— GODOT_BIN 默认值里的 .x86_64 改成 .arm64,与 setup_linux.sh 一致
+          sed -i 's|Godot_v4\.7-stable_linux\.x86_64|Godot_v4.7-stable_linux.arm64|' tools/linux_env.sh
+          echo "==> [3/6] tools/linux_env.sh: GODOT_BIN 默认值已改为 .arm64"
+
+          # 4. build/build_linux.sh —— 4 处硬编:
+          #    - Godot export template 路径 linux_${BUILD_TYPE_LOWER}.x86_64
+          #    - vcpkg 运行时库路径 vcpkg_installed/x64-linux/lib
+          #    - strip 步骤 find -name 'AetherKiri.x86_64'
+          #    - 导出二进制名 AetherKiri.x86_64
+          sed -i 's|linux_\${BUILD_TYPE_LOWER}\.x86_64|linux_${BUILD_TYPE_LOWER}.arm64|g' build/build_linux.sh
+          sed -i 's|vcpkg_installed/x64-linux/lib|vcpkg_installed/arm64-linux/lib|g' build/build_linux.sh
+          sed -i "s|'AetherKiri\\.x86_64'|'AetherKiri.arm64'|g" build/build_linux.sh
+          sed -i 's|AetherKiri\.x86_64|AetherKiri.arm64|g' build/build_linux.sh
+          echo "==> [4/6] build/build_linux.sh: 4 处硬编已全部 patch"
+
+          # 5. apps/godot_app/export_presets.cfg —— Godot export preset 里的:
+          #    - export_path="...Aether.x86_64" (debug + release 两份)
+          #    - binary_format/architecture="x86_64" (debug + release 两份)
+          #    Godot 会按 architecture 切平台 + 输出 arch 后缀的文件名
+          sed -i 's|Aether\.x86_64|Aether.arm64|g' apps/godot_app/export_presets.cfg
+          sed -i 's|binary_format/architecture="x86_64"|binary_format/architecture="arm64"|g' apps/godot_app/export_presets.cfg
+          echo "==> [5/6] apps/godot_app/export_presets.cfg: export_path + architecture 已改"
+
+          # 6. apps/godot_app/aether_kiri.gdextension —— Godot 找 GDExtension 库的 key 是
+          #    linux.debug.x86_64 / linux.release.x86_64。改成 .arm64 让 Godot 找 ARM64 库
+          #    (libaether_kiri_godot.so + libengine_api.so,均已由 vcpkg arm64-linux triplet 编出)
+          sed -i 's|linux\.debug\.x86_64|linux.debug.arm64|g' apps/godot_app/aether_kiri.gdextension
+          sed -i 's|linux\.release\.x86_64|linux.release.arm64|g' apps/godot_app/aether_kiri.gdextension
+          echo "==> [6/6] apps/godot_app/aether_kiri.gdextension: linux.{debug,release} 已改 .arm64"
+
+          echo ""
+          echo "==> ARM64 适配后 grep 自检(应为零行命中,除注释):"
+          grep -nE 'x86_64|x64-linux' \
+              CMakePresets.json \
+              tools/setup_linux.sh \
+              tools/linux_env.sh \
+              build/build_linux.sh \
+              apps/godot_app/export_presets.cfg \
+              apps/godot_app/aether_kiri.gdextension 2>&1 || echo "==> (干净,全部 patch 成功)"
 
       - name: 缓存工具链与下载
         uses: actions/cache@v4
