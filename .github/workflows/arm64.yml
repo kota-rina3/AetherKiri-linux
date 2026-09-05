@@ -505,13 +505,28 @@ jobs:
             echo "::warning::未找到 ${PANGO_PORT},跳过 sed(可能是 vcpkg-configuration.json 未配置 overlay)"
           fi
 
-          # 兜底:libgdiplus overlay 在 Linux 上硬编 -DWITH_X11=ON,即便装了 X11 dev,
-          # mono-libgdiplus 的 cmake 偶尔也会因为 pthreadstubs / Xrender 找不到而跪。
-          # 关掉 X11 是最后防线(只损失 libgdiplus 的 X11 surface 能力,Godot 视觉小说不依赖)。
+          # AetherKiri 的 overlay libgdiplus portfile 在 Linux 上硬编 -DWITH_X11=ON,
+          # 实际是个错误的设计权衡:
+          #   * libgdiplus 是 .NET/mono 兼容层(GDI+ surface),Godot 4 native 不走它
+          #   * Godot 4 的 X11 surface 走自己的 GDExtension,不依赖 libgdiplus
+          #   * 真用 libgdiplus 的是 Unity/MonoGame 之类非视觉小说引擎
+          #   * headless CI 容器没 X server,即便编出 X11 surface 也跑不出来
+          #   * arm64 runner 上 mono-libgdiplus 探测 pthreadstubs/Xrender 时 cmake 会因
+          #     aarch64 链接顺序差异反复跪掉
+          # 直接 WITHDRAW 掉 WITH_X11 的硬编:vcpkg 上游 default 是 OFF,我们尊重它。
+          # 只在 aarch64 上生效(x64 流水线已经走通,不冒不必要的回归风险)。
           LIBGDIPLUS_PORT="${GITHUB_WORKSPACE}/vcpkg/ports/libgdiplus/portfile.cmake"
-          if [[ -f "${LIBGDIPLUS_PORT}" ]] && grep -q 'WITH_X11=ON' "${LIBGDIPLUS_PORT}"; then
-            echo "==> libgdiplus overlay 仍硬编 WITH_X11=ON,先按 '已装 X11 dev' 尝试;"
-            echo "    若下一轮仍 BUILD_FAILED,可改为 WITH_X11=OFF 兜底。"
+          if [[ -f "${LIBGDIPLUS_PORT}" ]]; then
+            echo "==> ARM64: libgdiplus 强制放弃 WITH_X11(头无 X server、aarch64 cmake 探测易跪、GDI+ 不被 Godot native 调用)"
+            if grep -q 'WITH_X11=ON' "${LIBGDIPLUS_PORT}"; then
+              sed -i 's/-DWITH_X11=ON/-DWITH_X11=OFF/g' "${LIBGDIPLUS_PORT}"
+              echo "==> libgdiplus overlay 已 patch:"
+              grep -n 'WITH_X11' "${LIBGDIPLUS_PORT}" || true
+            else
+              echo "==> libgdiplus overlay 已经没有 WITH_X11=ON,跳过"
+            fi
+          else
+            echo "::warning::未找到 ${LIBGDIPLUS_PORT},跳过 sed(可能是 vcpkg-configuration.json 未配置 overlay)"
           fi
 
           echo "==> 开始 Linux ${BUILD_TYPE} 编译 (vcpkg 并发=${VCPKG_MAX_CONCURRENCY}, cmake/构建并发=$(nproc))"
