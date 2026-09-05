@@ -46,9 +46,9 @@ jobs:
       VCPKG_BUILD_TYPE: release
       # 强制关掉所有 meson port 的 introspection(gobject-introspection 1.0 检测常挂)
       VCPKG_MESON_CONFIGURE_OPTIONS: "-Dintrospection=disabled"
-      # 给 cmake/meson 一个已知的编译器,别让它瞎探测
-      CC: /usr/bin/gcc
-      CXX: /usr/bin/g++
+      # 编译器路径:不在 job env 硬编码,留空让 PATH 里 gcc/g++ 接管。
+      # 如果步骤 1 装了 gcc-13/g++-13,会通过 $GITHUB_ENV 写入 CC/CXX 覆盖此处。
+      # 这样没装 gcc-13 时也不会指错路,装了又能让后续步骤全用 gcc-13。
       DEBIAN_FRONTEND: noninteractive
       LANG: C.UTF-8
       LC_ALL: C.UTF-8
@@ -129,6 +129,23 @@ jobs:
             echo "::error::pkg-config 找不到 x11 或 xrender,libgdiplus 的 find_package(X11 REQUIRED) 必挂"
             exit 1
           fi
+          # gcc-13/g++-13 兜底:vcpkg baseline 默认 openal-soft 1.25.1 使用 C++20 <format> 头,
+          # GCC 12.x libstdc++ 不提供 <format>,编译会 `fatal error: format: No such file`。
+          # 装不上不阻塞 —— vcpkg.json override (下一步)会把 openal-soft 钉到 1.23.1(fmt 仍 vendored)。
+          if apt-get install -y --no-install-recommends gcc-13 g++-13 >/dev/null 2>&1; then
+            echo "==> gcc-13/g++-13 已装,设为默认编译器"
+            if command -v update-alternatives >/dev/null 2>&1; then
+              update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 2>/dev/null || true
+              update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 2>/dev/null || true
+            fi
+            # 让后续步骤(vcpkg/Godot 主代码)都用 gcc-13
+            echo "CC=/usr/bin/gcc-13"  >> "$GITHUB_ENV"
+            echo "CXX=/usr/bin/g++-13" >> "$GITHUB_ENV"
+            gcc --version | head -1
+            g++ --version | head -1
+          else
+            echo "::warning::Deepin 仓库无 gcc-13/g++-13,继续用 GCC 12 —— openal-soft 1.23.1(fmt vendored)兼容"
+          fi
           # 所有 apt 安装完成后再清包索引(省磁盘;提前清会让后续 install 全部失败)
           rm -rf /var/lib/apt/lists/*
 
@@ -195,6 +212,49 @@ jobs:
           else
             echo "::notice::未找到 vcpkg 二进制缓存脚本,跳过(继续构建)"
           fi
+
+      - name: 钉住 vcpkg 端口版本(GCC 12 兼容)
+        env:
+          VCPKG_JSON_PATH: ${{ github.workspace }}/vcpkg.json
+        run: |
+          # vcpkg baseline 默认的 openal-soft 1.25.1 使用 C++20 <format> 头,
+          # GCC 12.x libstdc++ 不提供 <format>。修法:钉到 1.23.1 —— 这个版本 fmt 仍 vendored,
+          # 无需 <format>,可在 GCC 12 下顺利编出。封装成永久 override 后,
+          # 后续即使 vcpkg baseline 升到 1.30.x,本仓库也始终用 1.23.1。
+          #
+          # 本步骤做两件事:(1) 若文件有 openal-soft override,尊重之;(2) 否则追加钉版。
+          # 同时利用 hashFiles(已在缓存 key 里)自动让缓存重建,无副作用。
+          if [[ ! -f "${VCPKG_JSON_PATH}" ]]; then
+            echo "::notice::未找到 vcpkg.json,跳过(可能用了 vcpkg-configuration.json 自定义 baseline)"
+            exit 0
+          fi
+          python3 - "${VCPKG_JSON_PATH}" <<'PY'
+          import json, sys, os
+          fp = sys.argv[1]
+          with open(fp, 'r', encoding='utf-8') as f:
+              doc = json.load(f)
+          overrides = doc.get('overrides', []) or []
+          user_pinned = [o for o in overrides if o.get('name') == 'openal-soft']
+          overrides = [o for o in overrides if o.get('name') != 'openal-soft']
+          if user_pinned:
+              pinned = user_pinned[0]
+              src = "用户原有 override"
+          else:
+              pinned = {"name": "openal-soft", "version": "1.23.1"}
+              src = "CI 自动追加"
+          overrides.append(pinned)
+          doc['overrides'] = overrides
+          tmp = fp + '.tmp'
+          with open(tmp, 'w', encoding='utf-8') as f:
+              json.dump(doc, f, indent=2, ensure_ascii=False)
+              f.write('\n')
+          os.replace(tmp, fp)
+          print(f"[ok] openal-soft 已钉版 ({src}): {pinned}")
+          print("==> 当前 vcpkg.json overrides 段:")
+          with open(fp, 'r', encoding='utf-8') as f:
+              for o in json.load(f).get('overrides', []):
+                  print(f"    - {o}")
+          PY
 
       - name: 编译
         continue-on-error: true
