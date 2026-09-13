@@ -345,6 +345,62 @@ jobs:
               for o in json.load(f).get('overrides', []):
                   print(f"    - {o}")
           PY
+          # 注意:baseline `9e593bb18ea69cc5095e012465dcd675a822ed0d`(2026-07-30)把 openal-soft
+          # 锁在 1.25.1。vcpkg overrides 字段在 versioning baseline 模式下,只能把版本钉到 >= baseline,
+          # 不能降到比 baseline 低的版本——所以上面把 openal-soft 钉到 1.23.1 在 baseline 模式下
+          # 被 vcpkg 静默忽略。本 step 不删,因为它是 manifest 模式 no-baseline 时的 fallback。
+          # 真正让 vcpkg 装 1.23.1 的兜底在下一步"openal-soft 1.23.1 overlay port"。
+          # (x64 流水线撞过这个坑后同步过来的注释 —— arm64 一致)
+
+      # vcpkg overlay port 钉 openal-soft 到 1.23.1 —— 唯一能绕过 baseline 锁版本的办法
+      #
+      # 根因:AetherKiri 的 vcpkg-configuration.json 用了 versioning baseline,
+      #   "default-registry": { "kind": "builtin", "baseline": "9e593bb..." (2026-07-30) }
+      # baseline 模式下,vcpkg.json 的 overrides 只能 >= baseline 对应 port 版本,不能往下降。
+      # baseline 9e593bb.. 时刻 openal-soft 是 1.25.1,1.25.1 用了 C++20 <format> 头
+      # (alformat.hpp:28),GCC 12.x libstdc++ 没这个头,直接 fatal error。
+      # 1.23.1 是最后一个用 vendored fmt + 不依赖 <format> 的版本,且 1.23.1 port-version 2
+      # 时刻的 vcpkg.json 只依赖 alsa + vcpkg-cmake,极简。
+      #
+      # 修法:在 ${GITHUB_WORKSPACE}/vcpkg/ports/openal-soft/ 写一个 overlay portfile,优先级
+      # 高于 vcpkg builtin,REF 硬编码 1.23.1,SHA512 用 1.23.1 的真实值。还要写 usage 文件
+      # (portfile.cmake 末尾 file(COPY .../usage ...) 依赖它存在)。这是 vcpkg 的官方 escape hatch:
+      # 文档明确允许 overlay port 用任意 upstream port 之外的 portfile 覆盖 builtin。
+      #
+      # arm64 特殊点:openal-soft 1.23.1 在 aarch64 上也要走同一条 ref(同一份 source),
+      # 因为 openal-soft 是 portable C/C++,没有 arch-specific patch。overlay portfile 完全
+      # 复用 x64 那份,vcpkg 自己会按 triplet 在 build 时切换 -mtune/-march。
+      - name: 添加 openal-soft 1.23.1 overlay port(GCC 12 兼容)
+        run: |
+          set -euo pipefail
+          OVERLAY_DIR="${GITHUB_WORKSPACE}/vcpkg/ports/openal-soft"
+          mkdir -p "${OVERLAY_DIR}"
+          # 1) 写 portfile.cmake —— 内容来自 vcpkg 9f54c912 那个 1.23.1 update commit,但:
+          #    - REF ${VERSION} 改成硬编码 1.23.1(绕开 baseline 的 VERSION 注入)
+          #    - 删 PATCHES 字段(原 patch 是 Android OpenSL fix,Linux 不需要)
+          curl -fsSL "https://raw.githubusercontent.com/microsoft/vcpkg/9f54c912f9b47ce7b3c69a2c824139cd549c9bea/ports/openal-soft/portfile.cmake" \
+              -o "${OVERLAY_DIR}/portfile.cmake"
+          # 2) sed 把 REF ${VERSION} 改 REF 1.23.1 + 删 PATCHES 行
+          sed -i 's|REF ${VERSION}|REF 1.23.1|' "${OVERLAY_DIR}/portfile.cmake"
+          # PATCHES 是多行,删 PATCHES 字段定义 + 后续引用行
+          sed -i '/^    PATCHES$/,/^[ \t]*\))$/d; s|^      c12ada68951ea67a59bef7d4fcdf22334990c12a\.patch.*$||' "${OVERLAY_DIR}/portfile.cmake"
+          # 3) 写 usage 文件(portfile.cmake 末尾 file(COPY "${CMAKE_CURRENT_LIST_DIR}/usage" ...)
+          #    会读这个文件,没有就 vcpkg install 失败)
+          # 用 python3 -c '...' 替代 <<'USAGE_EOF' heredoc —— 之前 session 踩过同款坑:
+          # yaml 字面块要求所有非空行 ≥ 块基缩进(本步是 10 空格),heredoc 终结符也得是
+          # 第 0 列(de-indent 后),嵌套在 if then 里就被吞掉 —— python -c 单引号更稳。
+          python3 -c '
+          openAL = "The package openal-soft provides CMake targets:\n\n    find_package(OpenAL CONFIG REQUIRED)\n    target_link_libraries(main PRIVATE OpenAL::OpenAL)\n"
+          with open("'"${OVERLAY_DIR}"'/usage", "w", encoding="utf-8") as f:
+              f.write(openAL)
+          print("==> usage 已写入:", "'"${OVERLAY_DIR}"'/usage")
+          '
+          echo "==> overlay port 已写入:"
+          ls -la "${OVERLAY_DIR}"
+          echo "==> portfile.cmake 关键段(REF / SHA512 / PATCHES):"
+          grep -nE 'REF |SHA512|PATCHES|c12ada68' "${OVERLAY_DIR}/portfile.cmake" || true
+          echo "==> usage:"
+          cat "${OVERLAY_DIR}/usage"
 
       # AetherKiri 的 rust/minori_runtime 是通过 CMake 调用 cargo 编译的 Rust 库:
       #   rust/minori_runtime/CMakeLists.txt:3  ->  find_program(CARGO_EXECUTABLE cargo)
