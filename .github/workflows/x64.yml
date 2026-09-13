@@ -171,6 +171,11 @@ jobs:
           # .gitmodules 中 psdfile 引用 SSH,CI 中强制覆盖为 HTTPS,免去 SSH 部署
           git -c submodule.packages/psdfile.url=https://github.com/AetherKiri/psdfile.git \
               submodule update --init --recursive --depth 1 packages/psdfile
+          # AetherSiglus 上游新加的子模块(2026-09 后),承载 siglus_rs 这个 Rust runtime;
+          # bridge/siglus_runtime/CMakeLists.txt:11 会硬检查 packages/AetherSiglus 存在,
+          # 不存在直接 abort。URL 已经是 HTTPS(.gitmodules 第 7 条),不需要 SSH fallback,
+          # 直接 update --init 即可。
+          git submodule update --init --depth 1 packages/AetherSiglus
 
       - name: 缓存工具链与下载
         uses: actions/cache@v4
@@ -282,6 +287,7 @@ jobs:
           workspaces: |
             rust -> rust/target
             rust/minori_runtime -> rust/minori_runtime/target
+            packages/AetherSiglus -> packages/AetherSiglus/target
           # 用 Lock 锁版本(没 lockfile 时退回到 manifest),避免 CI 里间接依赖飘了导致每次都重编译
           cache-on-failure: true
 
