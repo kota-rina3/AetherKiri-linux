@@ -187,6 +187,12 @@ jobs:
           # .gitmodules 中 psdfile 引用 SSH,CI 中强制覆盖为 HTTPS,免去 SSH 部署
           git -c submodule.packages/psdfile.url=https://github.com/AetherKiri/psdfile.git \
               submodule update --init --recursive --depth 1 packages/psdfile
+          # AetherSiglus 上游新加的子模块(2026-09 后),承载 siglus_rs 这个 Rust runtime;
+          # bridge/siglus_runtime/CMakeLists.txt:11 会硬检查 packages/AetherSiglus 存在,
+          # 不存在直接 abort。URL 已经是 HTTPS(.gitmodules 第 7 条),不需要 SSH fallback,
+          # 直接 update --init 即可。注意:这是 Rust workspace,arm64 上的 cargo target 由
+          # dtolnay/rust-toolchain@stable 自动选 aarch64-unknown-linux-gnu,无需额外配置。
+          git submodule update --init --depth 1 packages/AetherSiglus
 
       # 关键适配 step: AetherKiri-linux 上游目前只支持 Linux x86_64,硬编了 .x86_64 /
       # x64-linux 等 arch-specific 字符串到 6 个项目文件里。本 step 在 checkout 之后、
@@ -366,6 +372,7 @@ jobs:
           workspaces: |
             rust -> rust/target
             rust/minori_runtime -> rust/minori_runtime/target
+            packages/AetherSiglus -> packages/AetherSiglus/target
           # 用 Lock 锁版本(没 lockfile 时退回到 manifest),避免 CI 里间接依赖飘了导致每次都重编译
           cache-on-failure: true
 
