@@ -427,18 +427,80 @@ jobs:
             echo "::warning::未找到 ${PANGO_PORT},跳过 sed(可能是 vcpkg-configuration.json 未配置 overlay)"
           fi
 
-          # 兜底:libgdiplus overlay 在 Linux 上硬编 -DWITH_X11=ON,即便装了 X11 dev,
-          # mono-libgdiplus 的 cmake 偶尔也会因为 pthreadstubs / Xrender 找不到而跪。
-          # 关掉 X11 是最后防线(只损失 libgdiplus 的 X11 surface 能力,Godot 视觉小说不依赖)。
+          # libgdiplus overlay 在 Linux 上硬编 -DWITH_X11=ON,实际是 fork 的错误设计:
+          #   * libgdiplus 是 .NET/mono 兼容层(GDI+ surface),Godot 4 native 不走它
+          #   * Godot 4 的 X11 surface 走自己的 GDExtension,不依赖 libgdiplus
+          #   * 真用 libgdiplus 的是 Unity/MonoGame 之类非视觉小说引擎
+          #   * headless CI 容器没 X server,即便编出 X11 surface 也跑不出来
+          #   * x64 runner 上 vcpkg 之前一直被 binary cache 命中(libgdiplus 没真的从源码编过),
+          #     AetherSiglus 加进来后 vcpkg manifest 变化 → cache miss → 真编 → WITH_X11=ON
+          #     撞 pthreadstubs / Xrender 探测程序会因 -Wl,--no-undefined 链接失败
+          # 直接 WITHDRAW 掉 WITH_X11 的硬编:vcpkg 上游 default 是 OFF,我们尊重它。
+          # x64 + arm64 流水线都同样 sed(幂等,二次跑 no-op)
           LIBGDIPLUS_PORT="${GITHUB_WORKSPACE}/vcpkg/ports/libgdiplus/portfile.cmake"
-          if [[ -f "${LIBGDIPLUS_PORT}" ]] && grep -q 'WITH_X11=ON' "${LIBGDIPLUS_PORT}"; then
-            echo "==> libgdiplus overlay 仍硬编 WITH_X11=ON,先按 '已装 X11 dev' 尝试;"
-            echo "    若下一轮仍 BUILD_FAILED,可改为 WITH_X11=OFF 兜底。"
+          if [[ -f "${LIBGDIPLUS_PORT}" ]]; then
+            if grep -q 'WITH_X11=ON' "${LIBGDIPLUS_PORT}"; then
+              sed -i 's/-DWITH_X11=ON/-DWITH_X11=OFF/g' "${LIBGDIPLUS_PORT}"
+              echo "==> libgdiplus overlay 已 patch(WITH_X11=OFF):"
+              grep -n 'WITH_X11' "${LIBGDIPLUS_PORT}" || true
+            else
+              echo "==> libgdiplus overlay 已经没有 WITH_X11=ON,跳过"
+            fi
+          else
+            echo "::warning::未找到 ${LIBGDIPLUS_PORT},跳过 sed"
           fi
 
           echo "==> 开始 Linux ${BUILD_TYPE} 编译 (vcpkg 并发=${VCPKG_MAX_CONCURRENCY}, cmake/构建并发=$(nproc))"
           # ./build.sh linux release 内部已自带 parallelism 控制
           ./build.sh linux "$BUILD_TYPE" --jobs=$(nproc) 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # 主动诊断 step:vcpkg install 失败时,主日志里只有一行 "vcpkg install failed",
+      # 真正的错误在 .aetherkiri-cache/vcpkg/buildtrees/<port>/config-*-out.log 里。
+      # 这里 always() 跑:成功时只 cat manifest-install.log 尾部 30 行作为确认,
+      # 失败时主动展开每个 port 的 out.log / CMakeError.log,免去翻 artifact 排查
+      - name: vcpkg install 失败诊断(实时展开 buildtree 日志)
+        if: always()
+        run: |
+          set +e  # 本步骤本身不致命:只是诊断日志展开
+          BT="${{ github.workspace }}/.aetherkiri-cache/vcpkg/buildtrees"
+          MANIFEST_LOG="${{ github.workspace }}/out/linux/${BUILD_TYPE}/vcpkg-manifest-install.log"
+          if [[ ! -d "$BT" ]]; then
+            echo "==> vcpkg buildtrees 不存在($BT),跳过诊断"
+            exit 0
+          fi
+          echo "==> vcpkg manifest-install.log 尾部 30 行:"
+          if [[ -f "$MANIFEST_LOG" ]]; then
+            tail -30 "$MANIFEST_LOG"
+          else
+            echo "==> manifest-install.log 不存在"
+          fi
+          echo ""
+          echo "==> vcpkg buildtrees/<port>/config-*-out.log 尾部 80 行(每个失败 port):"
+          find "$BT" -maxdepth 2 -type f -name "config-*-out.log" 2>/dev/null | sort | while read -r f; do
+            # 只看 1 小时内修改的(本次运行产生的)
+            if [[ -n "$(find "$f" -mmin -60 2>/dev/null)" ]]; then
+              rel="${f#$BT/}"
+              echo ""
+              echo "=============================================="
+              echo "==> $rel"
+              echo "=============================================="
+              tail -80 "$f"
+            fi
+          done
+          # 进一步:把每个 port 的 CMakeError.log 也展开(那是 cmake configure 失败的真正错)
+          ERR_FILES=$(find "$BT" -maxdepth 3 -type f -name "CMakeError.log" 2>/dev/null | head -10)
+          if [[ -n "$ERR_FILES" ]]; then
+            echo ""
+            echo "==> vcpkg CMakeError.log 关键片段:"
+            for ef in $ERR_FILES; do
+              rel="${ef#$BT/}"
+              echo ""
+              echo "=============================================="
+              echo "==> $rel"
+              echo "=============================================="
+              tail -50 "$ef"
+            done
+          fi
 
       - name: ccache 统计
         if: always()
