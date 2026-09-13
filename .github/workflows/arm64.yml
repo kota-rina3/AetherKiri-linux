@@ -382,8 +382,14 @@ jobs:
               -o "${OVERLAY_DIR}/portfile.cmake"
           # 2) sed 把 REF ${VERSION} 改 REF 1.23.1 + 删 PATCHES 行
           sed -i 's|REF ${VERSION}|REF 1.23.1|' "${OVERLAY_DIR}/portfile.cmake"
-          # PATCHES 是多行,删 PATCHES 字段定义 + 后续引用行
-          sed -i '/^    PATCHES$/,/^[ \t]*\))$/d; s|^      c12ada68951ea67a59bef7d4fcdf22334990c12a\.patch.*$||' "${OVERLAY_DIR}/portfile.cmake"
+          # 拆成两个独立 sed,不要试图用范围匹配跨多行删 PATCHES 字段:
+          #   * 之前那个 `/^    PATCHES$/,/^[ \t]*\))$/d` 失败 —— `\)` 是 sed BRE 的右分组符号,
+          #     没有配对的 `\(` 开始,直接 "Unmatched ) or \)",exit 1。
+          #     而且即便语法正确,把 `)` 那行也一起删掉会让 vcpkg_from_github(...) 没结尾。
+          #   * 一个 sed 只干一件事最安全:删 PATCHES 关键字行 + 删 patch 文件引用行,
+          #     函数结尾的 `)` 保持原样不动。
+          sed -i '/^    PATCHES$/d' "${OVERLAY_DIR}/portfile.cmake"
+          sed -i '/^      c12ada68951ea67a59bef7d4fcdf22334990c12a\.patch/d' "${OVERLAY_DIR}/portfile.cmake"
           # 3) 写 usage 文件(portfile.cmake 末尾 file(COPY "${CMAKE_CURRENT_LIST_DIR}/usage" ...)
           #    会读这个文件,没有就 vcpkg install 失败)
           # 用 python3 -c '...' 替代 <<'USAGE_EOF' heredoc —— 之前 session 踩过同款坑:
