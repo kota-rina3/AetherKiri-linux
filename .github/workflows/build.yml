@@ -76,22 +76,29 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      GODOT_RELEASE: 4.7-stable
-      GODOT_TEMPLATE_VERSION: 4.7.stable
+      GODOT_RELEASE: 4.7.2-stable
+      GODOT_TEMPLATE_VERSION: 4.7.2.stable
       ANDROID_NDK_VERSION: 28.1.13356709
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
-          submodules: ${{ env.AETHERKIRI_WITH_INTERNAL == 'true' && 'recursive' || 'false' }}
-          ssh-key: ${{ env.AETHERKIRI_WITH_INTERNAL == 'true' && secrets.AETHERSECRET || '' }}
+          submodules: false
           persist-credentials: false
+
+      - name: Initialize private runtime submodules
+        if: env.AETHERKIRI_WITH_INTERNAL == 'true'
+        env:
+          AETHER_INTERNAL_DEPLOY_KEY: ${{ secrets.AETHERSECRET }}
+          AETHER_SOFTPAL_DEPLOY_KEY: ${{ secrets.AETHER_SOFTPAL_DEPLOY_KEY }}
+        run: .github/scripts/initialize-private-runtime-submodules.sh
 
       - name: Set up Rust for Minori
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android, i686-linux-android
+          components: rust-src
 
       - name: Resolve private runtime dependency cache
         id: private-runtime-cache-key
@@ -103,7 +110,7 @@ jobs:
 
       - name: Restore private runtime dependencies
         if: env.AETHERKIRI_WITH_INTERNAL == 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: packages/AetherInternal/.ci-cache/runtime-dependencies/android
           key: ${{ runner.os }}-${{ steps.private-runtime-cache-key.outputs.key }}
@@ -116,9 +123,10 @@ jobs:
         if: env.AETHERKIRI_WITH_INTERNAL != 'true'
         run: |
           git submodule update --init --depth 1 packages/OnscripterYuri
-          git -c submodule.packages/psdfile.url=https://github.com/AetherKiri/psdfile.git \
-            submodule update --init --recursive --depth 1 packages/psdfile
+          git submodule update --init --recursive --depth 1 packages/psdfile
           git submodule update --init --depth 1 packages/AetherSiglus
+          git submodule update --init --depth 1 packages/AetherMinori
+          git submodule update --init --depth 1 packages/AetherKrkr
 
       - name: Set application release version
         if: env.AETHERKIRI_RELEASE_VERSION != ''
@@ -129,11 +137,14 @@ jobs:
             --build-number "$release_build_number" \
             --github-env "$GITHUB_ENV"
 
-      - name: Verify AetherInternal package
+      - name: Verify private runtime packages
         if: env.AETHERKIRI_WITH_INTERNAL == 'true'
         run: |
           set -euo pipefail
           test -f packages/AetherInternal/cmake/AetherInternalConfig.cmake
+          test -f packages/AetherSoftPal/cmake/AetherSoftPalConfig.cmake
+          test "$(git -C packages/AetherSoftPal rev-parse HEAD)" = \
+            "$(git rev-parse HEAD:packages/AetherSoftPal)"
           git submodule status --recursive
 
       - name: Install Build Systems
@@ -144,7 +155,7 @@ jobs:
 
       - name: Restore ccache
         id: restore-ccache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: .ccache
           key: ${{ runner.os }}-android-ccache-v2
@@ -158,7 +169,7 @@ jobs:
           ccache -z
 
       - name: Set up Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -318,6 +329,12 @@ jobs:
           export CMAKE_CXX_COMPILER_LAUNCHER=ccache
           export NDK_CCACHE=ccache
           ./build.sh android release --jobs=4
+          if [[ "$AETHERKIRI_WITH_INTERNAL" == "true" ]]; then
+            grep -Fx 'AETHERKIRI_ENABLE_SOFTPAL_RUNTIME:BOOL=ON' \
+              out/android/arm64-v8a/release/CMakeCache.txt
+            grep -Fq 'packages/AetherSoftPal/aether_runtime/provider/SoftPalRuntimeProvider.cpp' \
+              out/android/arm64-v8a/release/compile_commands.json
+          fi
 
       - name: Build Android Debug
         run: |
@@ -344,7 +361,7 @@ jobs:
 
       - name: Save ccache
         if: success() && github.event_name != 'pull_request' && steps.restore-ccache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: .ccache
           key: ${{ runner.os }}-android-ccache-v2
@@ -355,16 +372,22 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      GODOT_RELEASE: 4.7-stable
-      GODOT_TEMPLATE_VERSION: 4.7.stable
+      GODOT_RELEASE: 4.7.2-stable
+      GODOT_TEMPLATE_VERSION: 4.7.2.stable
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
-          submodules: ${{ env.AETHERKIRI_WITH_INTERNAL == 'true' && 'recursive' || 'false' }}
-          ssh-key: ${{ env.AETHERKIRI_WITH_INTERNAL == 'true' && secrets.AETHERSECRET || '' }}
+          submodules: false
           persist-credentials: false
+
+      - name: Initialize private runtime submodules
+        if: env.AETHERKIRI_WITH_INTERNAL == 'true'
+        env:
+          AETHER_INTERNAL_DEPLOY_KEY: ${{ secrets.AETHERSECRET }}
+          AETHER_SOFTPAL_DEPLOY_KEY: ${{ secrets.AETHER_SOFTPAL_DEPLOY_KEY }}
+        run: .github/scripts/initialize-private-runtime-submodules.sh
 
       - name: Set up Rust for Minori
         uses: dtolnay/rust-toolchain@stable
@@ -381,7 +404,7 @@ jobs:
 
       - name: Restore private runtime dependencies
         if: env.AETHERKIRI_WITH_INTERNAL == 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: packages/AetherInternal/.ci-cache/runtime-dependencies/apple
           key: ${{ runner.os }}-${{ steps.private-runtime-cache-key.outputs.key }}
@@ -394,9 +417,10 @@ jobs:
         if: env.AETHERKIRI_WITH_INTERNAL != 'true'
         run: |
           git submodule update --init --depth 1 packages/OnscripterYuri
-          git -c submodule.packages/psdfile.url=https://github.com/AetherKiri/psdfile.git \
-            submodule update --init --recursive --depth 1 packages/psdfile
+          git submodule update --init --recursive --depth 1 packages/psdfile
           git submodule update --init --depth 1 packages/AetherSiglus
+          git submodule update --init --depth 1 packages/AetherMinori
+          git submodule update --init --depth 1 packages/AetherKrkr
 
       - name: Set application release version
         if: env.AETHERKIRI_RELEASE_VERSION != ''
@@ -438,11 +462,14 @@ jobs:
           fi
           echo "IOS_APP_STORE_SIGNING=1" >> "$GITHUB_ENV"
 
-      - name: Verify AetherInternal package
+      - name: Verify private runtime packages
         if: env.AETHERKIRI_WITH_INTERNAL == 'true'
         run: |
           set -euo pipefail
           test -f packages/AetherInternal/cmake/AetherInternalConfig.cmake
+          test -f packages/AetherSoftPal/cmake/AetherSoftPalConfig.cmake
+          test "$(git -C packages/AetherSoftPal rev-parse HEAD)" = \
+            "$(git rev-parse HEAD:packages/AetherSoftPal)"
           git submodule status --recursive
 
       - name: Install Build Systems
@@ -477,7 +504,7 @@ jobs:
 
       - name: Restore ccache
         id: restore-ccache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: .ccache
           key: ${{ runner.os }}-ios-ccache-v2
@@ -517,6 +544,12 @@ jobs:
           export CMAKE_C_COMPILER_LAUNCHER=ccache
           export CMAKE_CXX_COMPILER_LAUNCHER=ccache
           ./build.sh ios release --jobs=4 --package-ipa 2>&1 | tee "${RUNNER_TEMP}/ios-release-build.log"
+          if [[ "$AETHERKIRI_WITH_INTERNAL" == "true" ]]; then
+            grep -Fx 'AETHERKIRI_ENABLE_SOFTPAL_RUNTIME:BOOL=ON' \
+              out/ios/release/CMakeCache.txt
+            grep -Fq 'packages/AetherSoftPal/aether_runtime/provider/SoftPalRuntimeProvider.cpp' \
+              out/ios/release/compile_commands.json
+          fi
           if grep -E "SCRIPT ERROR|Failed to load script|Can't open GDExtension|Can't open dynamic library" "${RUNNER_TEMP}/ios-release-build.log"; then
             echo "Godot iOS release export logged script or GDExtension load errors." >&2
             exit 1
@@ -633,7 +666,7 @@ jobs:
 
       - name: Save ccache
         if: success() && github.event_name != 'pull_request' && steps.restore-ccache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: .ccache
           key: ${{ runner.os }}-ios-ccache-v2
@@ -644,8 +677,8 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      GODOT_RELEASE: 4.7-stable
-      GODOT_TEMPLATE_VERSION: 4.7.stable
+      GODOT_RELEASE: 4.7.2-stable
+      GODOT_TEMPLATE_VERSION: 4.7.2.stable
       AETHERKIRI_MACOS_ARCH: arm64
 
     steps:
@@ -659,11 +692,17 @@ jobs:
           xcodebuild -version
 
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
-          submodules: ${{ env.AETHERKIRI_WITH_INTERNAL == 'true' && 'recursive' || 'false' }}
-          ssh-key: ${{ env.AETHERKIRI_WITH_INTERNAL == 'true' && secrets.AETHERSECRET || '' }}
+          submodules: false
           persist-credentials: false
+
+      - name: Initialize private runtime submodules
+        if: env.AETHERKIRI_WITH_INTERNAL == 'true'
+        env:
+          AETHER_INTERNAL_DEPLOY_KEY: ${{ secrets.AETHERSECRET }}
+          AETHER_SOFTPAL_DEPLOY_KEY: ${{ secrets.AETHER_SOFTPAL_DEPLOY_KEY }}
+        run: .github/scripts/initialize-private-runtime-submodules.sh
 
       - name: Set up Rust for Minori
         uses: dtolnay/rust-toolchain@stable
@@ -680,7 +719,7 @@ jobs:
 
       - name: Restore private runtime dependencies
         if: env.AETHERKIRI_WITH_INTERNAL == 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: packages/AetherInternal/.ci-cache/runtime-dependencies/macos
           key: ${{ runner.os }}-${{ steps.private-runtime-cache-key.outputs.key }}
@@ -693,9 +732,10 @@ jobs:
         if: env.AETHERKIRI_WITH_INTERNAL != 'true'
         run: |
           git submodule update --init --depth 1 packages/OnscripterYuri
-          git -c submodule.packages/psdfile.url=https://github.com/AetherKiri/psdfile.git \
-            submodule update --init --recursive --depth 1 packages/psdfile
+          git submodule update --init --recursive --depth 1 packages/psdfile
           git submodule update --init --depth 1 packages/AetherSiglus
+          git submodule update --init --depth 1 packages/AetherMinori
+          git submodule update --init --depth 1 packages/AetherKrkr
 
       - name: Set application release version
         if: env.AETHERKIRI_RELEASE_VERSION != ''
@@ -728,11 +768,14 @@ jobs:
           fi
           echo "MACOS_APP_STORE_SIGNING=1" >> "$GITHUB_ENV"
 
-      - name: Verify AetherInternal package
+      - name: Verify private runtime packages
         if: env.AETHERKIRI_WITH_INTERNAL == 'true'
         run: |
           set -euo pipefail
           test -f packages/AetherInternal/cmake/AetherInternalConfig.cmake
+          test -f packages/AetherSoftPal/cmake/AetherSoftPalConfig.cmake
+          test "$(git -C packages/AetherSoftPal rev-parse HEAD)" = \
+            "$(git rev-parse HEAD:packages/AetherSoftPal)"
           git submodule status --recursive
 
       - name: Install Build Systems
@@ -767,7 +810,7 @@ jobs:
 
       - name: Restore ccache
         id: restore-ccache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: .ccache
           key: ${{ runner.os }}-macos-ccache-v2
@@ -802,7 +845,7 @@ jobs:
 
       - name: Restore vcpkg source cache
         id: restore-vcpkg-downloads
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: .devtools/vcpkg/downloads
           key: ${{ runner.os }}-vcpkg-downloads-${{ hashFiles('vcpkg-configuration.json', 'vcpkg.json', 'vcpkg/ports/**', 'vcpkg/triplets/**') }}
@@ -816,10 +859,16 @@ jobs:
           export CMAKE_C_COMPILER_LAUNCHER=ccache
           export CMAKE_CXX_COMPILER_LAUNCHER=ccache
           ./build.sh macos release --jobs=4
+          if [[ "$AETHERKIRI_WITH_INTERNAL" == "true" ]]; then
+            grep -Fx 'AETHERKIRI_ENABLE_SOFTPAL_RUNTIME:BOOL=ON' \
+              out/macos/release/CMakeCache.txt
+            grep -Fq 'packages/AetherSoftPal/aether_runtime/provider/SoftPalRuntimeProvider.cpp' \
+              out/macos/release/compile_commands.json
+          fi
 
       - name: Save vcpkg source cache
         if: always() && steps.restore-vcpkg-downloads.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: .devtools/vcpkg/downloads
           key: ${{ runner.os }}-vcpkg-downloads-${{ hashFiles('vcpkg-configuration.json', 'vcpkg.json', 'vcpkg/ports/**', 'vcpkg/triplets/**') }}
@@ -850,7 +899,7 @@ jobs:
           cmake --preset "MacOS Debug Config" --fresh \
             -B "$test_build_dir" \
             -D ENABLE_TESTS=ON \
-            -D BUILD_TOOLS=OFF \
+            -D BUILD_TOOLS=ON \
             -D BUILD_ENGINE_API=OFF \
             -D BUILD_GODOT_EXTENSION=OFF \
             -D VCPKG_MANIFEST_INSTALL=OFF \
@@ -872,6 +921,11 @@ jobs:
             --output-on-failure \
             --no-tests=error \
             --parallel 4
+
+          # The xp3 archive tools are built in this step so their standalone
+          # links cannot silently regress again (issue #241 Phase 2 fallout).
+          tools/bin/mac/dbg/xp3 --help >/dev/null
+          tools/bin/mac/dbg/xp3_select --help >/dev/null
 
       - name: Verify built .app
         run: |
@@ -951,211 +1005,7 @@ jobs:
 
       - name: Save ccache
         if: success() && github.event_name != 'pull_request' && steps.restore-ccache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: .ccache
           key: ${{ runner.os }}-macos-ccache-v2
-
-  web:
-    name: Build Web App
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      EMSDK_VERSION: 4.0.15
-      GODOT_RELEASE: 4.7-stable
-      GODOT_TEMPLATE_VERSION: 4.7.stable
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v6
-        with:
-          submodules: ${{ env.AETHERKIRI_WITH_INTERNAL == 'true' && 'recursive' || 'false' }}
-          ssh-key: ${{ env.AETHERKIRI_WITH_INTERNAL == 'true' && secrets.AETHERSECRET || '' }}
-          persist-credentials: false
-
-      - name: Set up Rust for Minori
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
-          targets: wasm32-unknown-emscripten
-
-      - name: Initialize public runtime packages
-        if: env.AETHERKIRI_WITH_INTERNAL != 'true'
-        run: |
-          git submodule update --init --depth 1 packages/OnscripterYuri
-          git -c submodule.packages/psdfile.url=https://github.com/AetherKiri/psdfile.git \
-            submodule update --init --recursive --depth 1 packages/psdfile
-          git submodule update --init --depth 1 packages/AetherSiglus
-
-      - name: Set application release version
-        if: env.AETHERKIRI_RELEASE_VERSION != ''
-        run: |
-          release_build_number=$((AETHERKIRI_BUILD_NUMBER * 100 + AETHERKIRI_BUILD_ATTEMPT))
-          python3 .github/scripts/set-release-version.py \
-            "$AETHERKIRI_RELEASE_VERSION" \
-            --build-number "$release_build_number" \
-            --github-env "$GITHUB_ENV"
-
-      - name: Verify AetherInternal package
-        if: env.AETHERKIRI_WITH_INTERNAL == 'true'
-        run: |
-          set -euo pipefail
-          test -f packages/AetherInternal/cmake/AetherInternalConfig.cmake
-          git submodule status --recursive
-
-      - name: Install Build Systems
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build pkg-config autoconf autoconf-archive automake libtool gettext bison flex curl unzip zip zstd ccache jq python3 mono-complete
-          rustup target add wasm32-unknown-unknown
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-          cache: npm
-
-      - name: Restore Emscripten cache
-        id: restore-emsdk
-        uses: actions/cache/restore@v5
-        with:
-          path: .devtools/emsdk
-          key: ${{ runner.os }}-emsdk-${{ env.EMSDK_VERSION }}
-
-      - name: Install Emscripten
-        run: |
-          set -euo pipefail
-          mkdir -p .devtools
-          if [[ ! -d ".devtools/emsdk/.git" ]]; then
-            rm -rf .devtools/emsdk
-            git clone https://github.com/emscripten-core/emsdk.git .devtools/emsdk
-          fi
-          .devtools/emsdk/emsdk install "$EMSDK_VERSION"
-          .devtools/emsdk/emsdk activate "$EMSDK_VERSION"
-          {
-            echo "EMSDK=${GITHUB_WORKSPACE}/.devtools/emsdk"
-            echo "EMSCRIPTEN_ROOT=${GITHUB_WORKSPACE}/.devtools/emsdk/upstream/emscripten"
-            echo "EMSDK_PYTHON=$(command -v python3)"
-          } >> "$GITHUB_ENV"
-          {
-            echo "${GITHUB_WORKSPACE}/.devtools/emsdk"
-            echo "${GITHUB_WORKSPACE}/.devtools/emsdk/upstream/emscripten"
-          } >> "$GITHUB_PATH"
-
-      - name: Install Godot export tools
-        run: |
-          set -euo pipefail
-          mkdir -p .godot "${RUNNER_TEMP}/godot-templates"
-          curl --fail --location --retry 5 --retry-delay 5 --retry-all-errors \
-            -o "${RUNNER_TEMP}/godot-linux.zip" \
-            "https://github.com/godotengine/godot-builds/releases/download/${GODOT_RELEASE}/Godot_v${GODOT_RELEASE}_linux.x86_64.zip"
-          unzip -tq "${RUNNER_TEMP}/godot-linux.zip"
-          unzip -q "${RUNNER_TEMP}/godot-linux.zip" -d .godot
-          godot_bin="$(find .godot -maxdepth 1 -type f -name 'Godot*_linux.x86_64' | head -1)"
-          if [[ -z "$godot_bin" ]]; then
-            echo "Godot Linux binary not found after unzip" >&2
-            exit 1
-          fi
-          chmod +x "$godot_bin"
-
-          curl --fail --location --retry 5 --retry-delay 5 --retry-all-errors \
-            -o "${RUNNER_TEMP}/godot-export-templates.tpz" \
-            "https://github.com/godotengine/godot-builds/releases/download/${GODOT_RELEASE}/Godot_v${GODOT_RELEASE}_export_templates.tpz"
-          unzip -tq "${RUNNER_TEMP}/godot-export-templates.tpz"
-          unzip -q "${RUNNER_TEMP}/godot-export-templates.tpz" -d "${RUNNER_TEMP}/godot-templates"
-          template_dir="${HOME}/.local/share/godot/export_templates/${GODOT_TEMPLATE_VERSION}"
-          mkdir -p "$template_dir"
-          cp -a "${RUNNER_TEMP}/godot-templates/templates/." "$template_dir/"
-
-          {
-            echo "GODOT_BIN=${GITHUB_WORKSPACE}/${godot_bin}"
-            echo "GODOT_TEMPLATE_DIR=${template_dir}"
-          } >> "$GITHUB_ENV"
-
-      - name: Restore ccache
-        id: restore-ccache
-        uses: actions/cache/restore@v5
-        with:
-          path: .ccache
-          key: ${{ runner.os }}-web-ccache-v2
-          restore-keys: |
-            ${{ runner.os }}-web-ccache-
-
-      - name: Setup ccache config
-        run: |
-          ccache --max-size=400M
-          ccache --cleanup
-          ccache -z
-
-      - name: Bootstrap vcpkg
-        run: |
-          set -euo pipefail
-          if [[ -d ".devtools/vcpkg" && ! -f ".devtools/vcpkg/.vcpkg-root" ]]; then
-            rm -rf .devtools/vcpkg
-          fi
-          if [[ ! -d ".devtools/vcpkg/.git" ]]; then
-            mkdir -p .devtools
-            git clone https://github.com/microsoft/vcpkg.git .devtools/vcpkg
-          fi
-          if [[ ! -x ".devtools/vcpkg/vcpkg" ]]; then
-            (cd .devtools/vcpkg && ./bootstrap-vcpkg.sh -disableMetrics)
-          fi
-          echo "VCPKG_ROOT=${GITHUB_WORKSPACE}/.devtools/vcpkg" >> "$GITHUB_ENV"
-
-      - name: Configure vcpkg binary cache
-        env:
-          VCPKG_PACKAGES_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/configure-vcpkg-binary-cache.sh "$VCPKG_ROOT/vcpkg"
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      - name: Typecheck Web scripts
-        run: npm run typecheck
-
-      - name: Build Web Release
-        run: |
-          set -euo pipefail
-          source .devtools/emsdk/emsdk_env.sh
-          chmod +x ./build.sh
-          export CMAKE_C_COMPILER_LAUNCHER=ccache
-          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-          ./build.sh web release --jobs=4 2>&1 | tee "${RUNNER_TEMP}/web-build.log"
-          if grep -E "SCRIPT ERROR|Failed to load script|Can't open GDExtension|Can't open dynamic library" "${RUNNER_TEMP}/web-build.log"; then
-            echo "Godot Web export logged script or GDExtension load errors." >&2
-            exit 1
-          fi
-
-      - name: Verify Web export
-        run: |
-          set -euo pipefail
-          test -f out/godot/web/release/index.html
-          test -f out/godot/web/release/index.wasm
-          test -f out/godot/web/release/index.pck
-          test -f out/godot/web/release/live2d/aetherkiri-live2d-bridge.js
-          node --check build/web_export_local_picker.js
-          node --check build/web_export_range_fs.js
-          node --check build/patch_web_export.mjs
-
-      - name: Upload Artifact
-        if: success()
-        uses: actions/upload-artifact@v7
-        with:
-          name: web-release-export
-          path: out/godot/web/release
-          retention-days: 7
-
-      - name: Save Emscripten cache
-        if: success() && github.event_name != 'pull_request' && steps.restore-emsdk.outputs.cache-matched-key == ''
-        uses: actions/cache/save@v5
-        with:
-          path: .devtools/emsdk
-          key: ${{ runner.os }}-emsdk-${{ env.EMSDK_VERSION }}
-
-      - name: Save ccache
-        if: success() && github.event_name != 'pull_request' && steps.restore-ccache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: .ccache
-          key: ${{ runner.os }}-web-ccache-v2
